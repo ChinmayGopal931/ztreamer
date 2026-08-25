@@ -1,36 +1,31 @@
-use zakura_chain::{block::Height, parameters::Network};
-use zakura_state::{
-    Config, NonFinalizedState, ReadStateService, StateInitError, ZakuraDb, init_read_only,
-};
+use zakura_chain::block::Height;
+use zakura_state::{ReadStateService, ZakuraDb};
+use zakurad::node::NodeClient;
 
 use crate::{
     index::{Index, IndexState},
-    pipeline::{PipelineConfig, PipelineError, sync_historical},
+    parser::RawIndexBlock,
+    pipeline::{PipelineConfig, PipelineError, SourceRange, sync_historical},
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum ZakuraSyncError {
-    #[error("failed to catch the Zakura secondary up with its primary: {0}")]
-    CatchUp(String),
     #[error(transparent)]
     Pipeline(#[from] PipelineError),
 }
 
-/// One read-only Zakura secondary shared by historical ingestion and delegated RPC reads.
-pub struct ZakuraSecondary {
+/// In-process access to Zakura's finalized database and state reads.
+pub struct ZakuraSource {
     read_service: ReadStateService,
     db: ZakuraDb,
-    _non_finalized_sender: tokio::sync::watch::Sender<NonFinalizedState>,
 }
 
-impl ZakuraSecondary {
-    pub fn open(state_config: Config, network: &Network) -> Result<Self, StateInitError> {
-        let (read_service, db, non_finalized_sender) = init_read_only(state_config, network)?;
-        Ok(Self {
-            read_service,
-            db,
-            _non_finalized_sender: non_finalized_sender,
-        })
+impl ZakuraSource {
+    pub fn new(client: &NodeClient) -> Self {
+        Self {
+            read_service: client.read_state(),
+            db: client.database(),
+        }
     }
 
     pub fn read_service(&self) -> ReadStateService {
@@ -44,15 +39,9 @@ impl ZakuraSecondary {
     ) -> Result<IndexState, ZakuraSyncError> {
         let mut previous_tip = None;
         loop {
-            self.db
-                .try_catch_up_with_primary()
-                .map_err(|error| ZakuraSyncError::CatchUp(error.to_string()))?;
             let state = sync_historical(
                 index,
-                |start, count, max_bytes| {
-                    self.db
-                        .read_compact_index_source_range(Height(start), count, max_bytes)
-                },
+                |start, count, max_bytes| self.read_range(start, count, max_bytes),
                 pipeline_config,
             )?;
             if previous_tip == Some(state.durable_tip()) {
@@ -60,5 +49,74 @@ impl ZakuraSecondary {
             }
             previous_tip = Some(state.durable_tip());
         }
+    }
+
+    fn read_range(
+        &self,
+        start: u32,
+        count: u32,
+        max_bytes: usize,
+    ) -> Result<SourceRange, PipelineError> {
+        let source_tip = self.db.tip();
+        let retained_body_floor = self.db.prune_height().unwrap_or(Height::MIN);
+        let mut blocks = Vec::new();
+        let mut response_bytes = 0usize;
+
+        for offset in 0..count {
+            let Some(height) = start.checked_add(offset).map(Height) else {
+                break;
+            };
+            if source_tip.is_none_or(|(tip, _)| height > tip) {
+                break;
+            }
+            let hash = self.db.hash(height).ok_or(PipelineError::SourceGap {
+                expected: height.0,
+                actual: None,
+            })?;
+            let bytes = self
+                .db
+                .raw_block_bytes(height.into())
+                .ok_or(PipelineError::MissingBody { height: height.0 })?;
+            let txids = self
+                .db
+                .transaction_hashes_for_block(height.into())
+                .ok_or(PipelineError::MissingBody { height: height.0 })?
+                .to_vec();
+            let block_bytes = bytes
+                .len()
+                .checked_add(
+                    txids
+                        .len()
+                        .checked_mul(32)
+                        .ok_or(PipelineError::SourceSize { height: height.0 })?,
+                )
+                .ok_or(PipelineError::SourceSize { height: height.0 })?;
+            let next_response_bytes = response_bytes
+                .checked_add(block_bytes)
+                .ok_or(PipelineError::SourceSize { height: height.0 })?;
+            if next_response_bytes > max_bytes {
+                if blocks.is_empty() {
+                    return Err(PipelineError::BlockExceedsByteLimit {
+                        height: height.0,
+                        required: block_bytes,
+                        limit: max_bytes,
+                    });
+                }
+                break;
+            }
+            response_bytes = next_response_bytes;
+            blocks.push(RawIndexBlock {
+                height,
+                hash,
+                bytes,
+                txids,
+            });
+        }
+
+        Ok(SourceRange {
+            blocks,
+            retained_body_floor,
+            source_tip,
+        })
     }
 }

@@ -849,9 +849,12 @@ mod tests {
     use super::*;
     use tokio_stream::StreamExt;
     use zakura_chain::{block, parameters::Network, transaction};
-    use zakura_state::{CompactIndexSourceRange, Config, RawIndexBlock, RawIndexTransaction};
+    use zakura_state::Config;
 
-    use crate::pipeline::{PipelineConfig, sync_historical};
+    use crate::{
+        parser::RawIndexBlock,
+        pipeline::{PipelineConfig, SourceRange, sync_historical},
+    };
 
     struct HeadSource(Vec<RawIndexBlock>);
 
@@ -931,7 +934,7 @@ mod tests {
                 let state = sync_historical(
                     &index,
                     |start, count, _| {
-                        Ok(CompactIndexSourceRange {
+                        Ok(SourceRange {
                             blocks: (start..start + count).map(raw_block).collect(),
                             retained_body_floor: block::Height(0),
                             source_tip: Some(tip),
@@ -1088,17 +1091,15 @@ mod tests {
     }
 
     fn raw_block(height: u32) -> RawIndexBlock {
-        let mut header = vec![0; 140];
-        header[4..36].copy_from_slice(&height.checked_sub(1).map(hash).unwrap_or([0; 32]));
-        header[100..104].copy_from_slice(&height.to_le_bytes());
+        let mut bytes = vec![0; 140];
+        bytes[4..36].copy_from_slice(&height.checked_sub(1).map(hash).unwrap_or([0; 32]));
+        bytes[100..104].copy_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&[0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         RawIndexBlock {
             height: block::Height(height),
             hash: block::Hash(hash(height)),
-            header,
-            transactions: vec![RawIndexTransaction {
-                txid: transaction::Hash(hash(height)),
-                bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            }],
+            bytes,
+            txids: vec![transaction::Hash(hash(height))],
         }
     }
 

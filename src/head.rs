@@ -1,29 +1,26 @@
-use tonic::{Code, Status, transport::Channel};
 use zakura_chain::{
     block::{self, Block},
-    serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashSerialize},
+    serialization::ZcashSerialize,
 };
-use zakura_state::{MAX_BLOCK_REORG_HEIGHT, RawIndexBlock, RawIndexTransaction};
+use zakura_state::MAX_BLOCK_REORG_HEIGHT;
+use zakurad::node::NodeClient;
 
 use crate::{
     codec::CompactBlockRecord,
     index::{Index, IndexError, IndexState, PERSIST_DEPTH, SEAL_DEPTH},
     ingest::{IngestError, OrderedBuilder},
-    parser::{CompactParseError, PreparedCompactBlock, parse_block},
+    parser::{CompactParseError, PreparedCompactBlock, RawIndexBlock, parse_block},
     pipeline::PipelineConfig,
-    zakura_proto::{BlockRequest, indexer_client::IndexerClient},
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum HeadError {
     #[error("Zakura head request failed: {0}")]
-    Rpc(#[from] Status),
+    Node(String),
     #[error("Zakura head block could not be decoded: {0}")]
     Decode(String),
     #[error("Zakura returned height {actual} for requested height {expected}")]
     Height { expected: u32, actual: u32 },
-    #[error("Zakura returned a block whose supplied hash does not match its header")]
-    Hash,
     #[error("Zakura canonical block {height} does not connect to its predecessor")]
     Parent { height: u32 },
     #[error("the local anchor at height {height} is not canonical in Zakura")]
@@ -56,69 +53,34 @@ pub trait CanonicalBlockSource: Send {
     async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError>;
 }
 
-/// A narrow client for Zakura's trusted indexer `GetBlock` RPC.
-pub struct ZakuraHeadClient {
-    inner: IndexerClient<Channel>,
-}
-
-impl ZakuraHeadClient {
-    pub async fn connect(endpoint: String) -> Result<Self, tonic::transport::Error> {
-        Ok(Self {
-            inner: IndexerClient::connect(endpoint).await?,
-        })
-    }
-
-    fn decode(response: crate::zakura_proto::BlockAndHash) -> Result<RawIndexBlock, HeadError> {
-        let supplied_hash: [u8; 32] = response
-            .hash
-            .try_into()
-            .map_err(|hash: Vec<u8>| HeadError::Decode(format!("hash has {} bytes", hash.len())))?;
-        let supplied_hash = block::Hash::from_bytes_in_display_order(&supplied_hash);
-        let block = Block::zcash_deserialize(response.data.as_slice())
-            .map_err(|error| HeadError::Decode(error.to_string()))?;
-        if block.hash() != supplied_hash {
-            return Err(HeadError::Hash);
-        }
-        let height = block
-            .coinbase_height()
-            .ok_or_else(|| HeadError::Decode("coinbase height is missing".to_owned()))?;
-        let header = block
-            .header
-            .zcash_serialize_to_vec()
-            .map_err(|error| HeadError::Decode(error.to_string()))?;
-        let transactions = block
-            .transactions
-            .iter()
-            .map(|transaction| {
-                Ok(RawIndexTransaction {
-                    txid: transaction.hash(),
-                    bytes: transaction
-                        .zcash_serialize_to_vec()
-                        .map_err(|error| HeadError::Decode(error.to_string()))?,
-                })
-            })
-            .collect::<Result<_, HeadError>>()?;
-        Ok(RawIndexBlock {
-            height,
-            hash: supplied_hash,
-            header,
-            transactions,
-        })
-    }
+fn raw_block(block: &Block) -> Result<RawIndexBlock, HeadError> {
+    let hash = block.hash();
+    let height = block
+        .coinbase_height()
+        .ok_or_else(|| HeadError::Decode("coinbase height is missing".to_owned()))?;
+    let bytes = block
+        .zcash_serialize_to_vec()
+        .map_err(|error| HeadError::Decode(error.to_string()))?;
+    let txids = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.hash())
+        .collect();
+    Ok(RawIndexBlock {
+        height,
+        hash,
+        bytes,
+        txids,
+    })
 }
 
 #[tonic::async_trait]
-impl CanonicalBlockSource for ZakuraHeadClient {
+impl CanonicalBlockSource for NodeClient {
     async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError> {
-        let response = self
-            .inner
-            .get_block(BlockRequest {
-                hash_or_height: height.to_be_bytes().to_vec(),
-            })
-            .await;
-        match response {
-            Ok(response) => {
-                let block = Self::decode(response.into_inner())?;
+        let block = NodeClient::block(self, block::Height(height)).await;
+        match block {
+            Ok(Some(block)) => {
+                let block = raw_block(&block)?;
                 if block.height.0 != height {
                     return Err(HeadError::Height {
                         expected: height,
@@ -127,8 +89,8 @@ impl CanonicalBlockSource for ZakuraHeadClient {
                 }
                 Ok(Some(block))
             }
-            Err(status) if status.code() == Code::NotFound => Ok(None),
-            Err(status) => Err(status.into()),
+            Ok(None) => Ok(None),
+            Err(error) => Err(HeadError::Node(error.to_string())),
         }
     }
 }
@@ -161,7 +123,7 @@ pub async fn poll_canonical_head(
             return Err(HeadError::Window);
         }
         let parent: [u8; 32] = block
-            .header
+            .bytes
             .get(4..36)
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(|| HeadError::Decode("block header is truncated".to_owned()))?;
@@ -546,17 +508,15 @@ mod tests {
     }
 
     fn raw_block(height: u32) -> RawIndexBlock {
-        let mut header = vec![0; 140];
-        header[4..36].copy_from_slice(&height.checked_sub(1).map(hash).unwrap_or([0; 32]));
-        header[100..104].copy_from_slice(&height.to_le_bytes());
+        let mut bytes = vec![0; 140];
+        bytes[4..36].copy_from_slice(&height.checked_sub(1).map(hash).unwrap_or([0; 32]));
+        bytes[100..104].copy_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&[0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         RawIndexBlock {
             height: block::Height(height),
             hash: block::Hash(hash(height)),
-            header,
-            transactions: vec![RawIndexTransaction {
-                txid: transaction::Hash(hash(height)),
-                bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            }],
+            bytes,
+            txids: vec![transaction::Hash(hash(height))],
         }
     }
 
@@ -564,8 +524,8 @@ mod tests {
         let mut block = raw_block(height);
         if height >= fork {
             block.hash = block::Hash(branch_hash(height));
-            block.transactions[0].txid = transaction::Hash(branch_hash(height));
-            block.header[4..36].copy_from_slice(&if height == fork {
+            block.txids[0] = transaction::Hash(branch_hash(height));
+            block.bytes[4..36].copy_from_slice(&if height == fork {
                 hash(height - 1)
             } else {
                 branch_hash(height - 1)

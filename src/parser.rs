@@ -1,7 +1,9 @@
-use zakura_state::{RawIndexBlock, RawIndexTransaction};
+use zakura_chain::{block, transaction};
 
 const MAX_TRANSACTION_BYTES: usize = 2_000_000;
 const MAX_VECTOR_ITEMS: usize = u16::MAX as usize;
+const MAX_EQUIHASH_SOLUTION_BYTES: usize = 1_344;
+const HEADER_PREFIX_BYTES: usize = 140;
 const COMPACT_CIPHERTEXT_BYTES: usize = 52;
 
 const OVERWINTER_GROUP_ID: u32 = 0x03c4_8270;
@@ -16,6 +18,14 @@ const SAPLING_V4_OUTPUT_BYTES: usize = 948;
 const ORCHARD_ACTION_BYTES: usize = 820;
 const BCTV14_JOINSPLIT_BYTES: usize = 1_802;
 const GROTH16_JOINSPLIT_BYTES: usize = 1_698;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawIndexBlock {
+    pub height: block::Height,
+    pub hash: block::Hash,
+    pub bytes: Vec<u8>,
+    pub txids: Vec<transaction::Hash>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompactSaplingOutput {
@@ -68,6 +78,18 @@ pub struct PreparedCompactBlock {
 pub enum CompactParseError {
     #[error("block {height} has a truncated header")]
     TruncatedHeader { height: u32 },
+    #[error("block {height} framing: {source}")]
+    Framing {
+        height: u32,
+        #[source]
+        source: TransactionParseError,
+    },
+    #[error("block {height} contains {transactions} transactions but Zakura supplied {txids} IDs")]
+    TransactionCount {
+        height: u32,
+        transactions: usize,
+        txids: usize,
+    },
     #[error("block {height} transaction {index}: {source}")]
     Transaction {
         height: u32,
@@ -99,14 +121,35 @@ pub enum TransactionParseError {
 
 pub fn parse_block(block: &RawIndexBlock) -> Result<PreparedCompactBlock, CompactParseError> {
     let height = block.height.0;
+    let mut reader = Reader::new(&block.bytes);
+    reader
+        .skip(HEADER_PREFIX_BYTES)
+        .map_err(|_| CompactParseError::TruncatedHeader { height })?;
+    let solution_bytes = reader
+        .compact_size(MAX_EQUIHASH_SOLUTION_BYTES)
+        .map_err(|source| CompactParseError::Framing { height, source })?;
+    reader
+        .skip(solution_bytes)
+        .map_err(|_| CompactParseError::TruncatedHeader { height })?;
+    let header_end = reader.offset;
+    let transaction_count = reader
+        .compact_size(MAX_VECTOR_ITEMS)
+        .map_err(|source| CompactParseError::Framing { height, source })?;
+    if transaction_count != block.txids.len() {
+        return Err(CompactParseError::TransactionCount {
+            height,
+            transactions: transaction_count,
+            txids: block.txids.len(),
+        });
+    }
     let previous_hash = block
-        .header
+        .bytes
         .get(4..36)
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(CompactParseError::TruncatedHeader { height })?;
     let time = u32::from_le_bytes(
         block
-            .header
+            .bytes
             .get(100..104)
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or(CompactParseError::TruncatedHeader { height })?,
@@ -117,14 +160,23 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<PreparedCompactBlock, Compac
     let mut orchard_additions = 0usize;
     let mut ironwood_additions = 0usize;
 
-    for (index, transaction) in block.transactions.iter().enumerate() {
-        let compact = parse_transaction(transaction, index as u64).map_err(|source| {
-            CompactParseError::Transaction {
+    for (index, txid) in block.txids.iter().enumerate() {
+        let start = reader.offset;
+        let compact =
+            parse_transaction_from(&mut reader, *txid, index as u64).map_err(|source| {
+                CompactParseError::Transaction {
+                    height,
+                    index,
+                    source,
+                }
+            })?;
+        if reader.offset - start > MAX_TRANSACTION_BYTES {
+            return Err(CompactParseError::Transaction {
                 height,
                 index,
-                source,
-            }
-        })?;
+                source: TransactionParseError::TooLarge,
+            });
+        }
         sapling_additions = sapling_additions
             .checked_add(compact.sapling_outputs.len())
             .ok_or(CompactParseError::CommitmentCount { height })?;
@@ -138,13 +190,16 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<PreparedCompactBlock, Compac
             transactions.push(compact);
         }
     }
+    reader
+        .finish()
+        .map_err(|source| CompactParseError::Framing { height, source })?;
 
     Ok(PreparedCompactBlock {
         height,
         hash: block.hash.0,
         previous_hash,
         time,
-        header: block.header.clone(),
+        header: block.bytes[..header_end].to_vec(),
         transactions,
         sapling_additions: sapling_additions
             .try_into()
@@ -158,21 +213,33 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<PreparedCompactBlock, Compac
     })
 }
 
+#[cfg(test)]
 fn parse_transaction(
-    transaction: &RawIndexTransaction,
+    bytes: &[u8],
+    txid: transaction::Hash,
     index: u64,
 ) -> Result<CompactTransaction, TransactionParseError> {
-    if transaction.bytes.len() > MAX_TRANSACTION_BYTES {
+    if bytes.len() > MAX_TRANSACTION_BYTES {
         return Err(TransactionParseError::TooLarge);
     }
 
-    let mut reader = Reader::new(&transaction.bytes);
+    let mut reader = Reader::new(bytes);
+    let compact = parse_transaction_from(&mut reader, txid, index)?;
+    reader.finish()?;
+    Ok(compact)
+}
+
+fn parse_transaction_from(
+    reader: &mut Reader<'_>,
+    txid: transaction::Hash,
+    index: u64,
+) -> Result<CompactTransaction, TransactionParseError> {
     let header = reader.u32()?;
     let version = header & 0x7fff_ffff;
     let overwintered = header >> 31 != 0;
     let mut compact = CompactTransaction {
         index,
-        txid: transaction.txid.0,
+        txid: txid.0,
         sapling_spends: Vec::new(),
         sapling_outputs: Vec::new(),
         orchard_actions: Vec::new(),
@@ -219,7 +286,6 @@ fn parse_transaction(
         _ => return Err(TransactionParseError::UnsupportedHeader { header }),
     }
 
-    reader.finish()?;
     Ok(compact)
 }
 
@@ -276,14 +342,14 @@ impl<'a> Reader<'a> {
             }
             254 => {
                 let value = self.u32()?;
-                if value <= u16::MAX.into() {
+                if value <= u32::from(u16::MAX) {
                     return Err(TransactionParseError::NonCanonicalCompactSize { offset: start });
                 }
                 u64::from(value)
             }
             255 => {
                 let value = u64::from_le_bytes(self.array()?);
-                if value <= u32::MAX.into() {
+                if value <= u64::from(u32::MAX) {
                     return Err(TransactionParseError::NonCanonicalCompactSize { offset: start });
                 }
                 value
@@ -465,7 +531,7 @@ impl<'a> Reader<'a> {
         Ok(actions)
     }
 
-    fn finish(self) -> Result<(), TransactionParseError> {
+    fn finish(&self) -> Result<(), TransactionParseError> {
         if self.offset == self.bytes.len() {
             Ok(())
         } else {
@@ -502,13 +568,34 @@ mod tests {
         for encoded_block in [SAPLING_BLOCK, SAPLING_SPEND_BLOCK, ORCHARD_BLOCK] {
             let bytes = hex::decode(encoded_block.trim()).unwrap();
             let block = Block::zcash_deserialize(bytes.as_slice()).unwrap();
+            let height = block.coinbase_height().unwrap();
+            let parsed = parse_block(&RawIndexBlock {
+                height,
+                hash: block.hash(),
+                bytes,
+                txids: block
+                    .transactions
+                    .iter()
+                    .map(|transaction| transaction.hash())
+                    .collect(),
+            })
+            .unwrap();
+            let expected_transactions = block
+                .transactions
+                .iter()
+                .enumerate()
+                .map(|(index, transaction)| reference(transaction, index as u64))
+                .filter(CompactTransaction::has_payload)
+                .collect::<Vec<_>>();
+            assert_eq!(parsed.transactions, expected_transactions);
+            assert_eq!(
+                parsed.header,
+                block.header.zcash_serialize_to_vec().unwrap()
+            );
+
             for (index, transaction) in block.transactions.iter().enumerate() {
                 let bytes = transaction.zcash_serialize_to_vec().unwrap();
-                let raw = RawIndexTransaction {
-                    txid: transaction.hash(),
-                    bytes,
-                };
-                let actual = parse_transaction(&raw, index as u64).unwrap();
+                let actual = parse_transaction(&bytes, transaction.hash(), index as u64).unwrap();
                 let expected = reference(transaction, index as u64);
                 saw_sapling |= !expected.sapling_outputs.is_empty();
                 saw_sapling_spend |= !expected.sapling_spends.is_empty();
@@ -541,24 +628,18 @@ mod tests {
         };
         let bytes = transaction.zcash_serialize_to_vec().unwrap();
         let parsed = Transaction::zcash_deserialize(bytes.as_slice()).unwrap();
-        let raw = RawIndexTransaction {
-            txid: parsed.hash(),
-            bytes,
-        };
-
-        assert_eq!(parse_transaction(&raw, 0).unwrap(), reference(&parsed, 0));
+        assert_eq!(
+            parse_transaction(&bytes, parsed.hash(), 0).unwrap(),
+            reference(&parsed, 0)
+        );
     }
 
     #[test]
     fn malformed_lengths_are_bounded() {
         let mut bytes = vec![1, 0, 0, 0, 0xff];
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
-        let raw = RawIndexTransaction {
-            txid: zakura_chain::transaction::Hash([0; 32]),
-            bytes,
-        };
         assert!(matches!(
-            parse_transaction(&raw, 0),
+            parse_transaction(&bytes, zakura_chain::transaction::Hash([0; 32]), 0),
             Err(TransactionParseError::LengthLimit { .. })
         ));
     }

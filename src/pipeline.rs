@@ -7,18 +7,24 @@ use std::{
     thread,
 };
 
-use zakura_state::{
-    CompactIndexSourceError, CompactIndexSourceRange, MAX_COMPACT_INDEX_SOURCE_BLOCKS,
-    MAX_COMPACT_INDEX_SOURCE_BYTES,
-};
+use zakura_chain::block;
 
 use crate::{
     index::{Index, IndexError, IndexState},
     ingest::{IngestError, OrderedBuilder},
-    parser::{CompactParseError, parse_block},
+    parser::{CompactParseError, RawIndexBlock, parse_block},
 };
 
 const MIB: usize = 1024 * 1024;
+pub(crate) const MAX_SOURCE_BLOCKS: u32 = 256;
+pub(crate) const MAX_SOURCE_BYTES: usize = 64 * MIB;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRange {
+    pub blocks: Vec<RawIndexBlock>,
+    pub retained_body_floor: block::Height,
+    pub source_tip: Option<(block::Height, block::Hash)>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PipelineConfig {
@@ -47,8 +53,6 @@ impl Default for PipelineConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     #[error(transparent)]
-    Source(#[from] CompactIndexSourceError),
-    #[error(transparent)]
     Parse(#[from] CompactParseError),
     #[error(transparent)]
     Ingest(#[from] IngestError),
@@ -60,6 +64,14 @@ pub enum PipelineError {
     NoSourceTip,
     #[error("Zakura has pruned the required block body at height {height}")]
     MissingBody { height: u32 },
+    #[error("Zakura block at height {height} needs {required} source bytes, limit is {limit}")]
+    BlockExceedsByteLimit {
+        height: u32,
+        required: usize,
+        limit: usize,
+    },
+    #[error("Zakura source size overflowed at height {height}")]
+    SourceSize { height: u32 },
     #[error("Zakura source changed during historical ingestion")]
     SourceChanged,
     #[error("LMDB durable tip at height {height} does not match Zakura")]
@@ -74,15 +86,14 @@ pub enum PipelineError {
 
 /// Ingests the finalized durable prefix using bounded fetch, parse, and write stages.
 ///
-/// The caller owns secondary catch-up: `source` must read one stable secondary view for
-/// the duration of this call.
+/// The captured finalized prefix is immutable; the live source tip may grow during this call.
 pub fn sync_historical<F>(
     index: &Index,
     source: F,
     config: PipelineConfig,
 ) -> Result<IndexState, PipelineError>
 where
-    F: Fn(u32, u32, usize) -> Result<CompactIndexSourceRange, CompactIndexSourceError> + Sync,
+    F: Fn(u32, u32, usize) -> Result<SourceRange, PipelineError> + Sync,
 {
     validate_config(config)?;
     let initial_state = index.state()?;
@@ -90,8 +101,7 @@ where
     let start = durable_tip.map_or(Ok(0), |tip| {
         tip.height.checked_add(1).ok_or(IngestError::Overflow)
     })?;
-    let request_bytes =
-        (config.max_source_bytes / config.fetch_workers).clamp(1, MAX_COMPACT_INDEX_SOURCE_BYTES);
+    let request_bytes = (config.max_source_bytes / config.fetch_workers).clamp(1, MAX_SOURCE_BYTES);
     let probe = source(
         durable_tip.map_or(start, |tip| tip.height),
         u32::from(durable_tip.is_some()),
@@ -173,7 +183,9 @@ where
                         while u64::from(cursor) <= segment_end {
                             let count = (segment_end - u64::from(cursor) + 1) as u32;
                             let range = source(cursor, count, request_bytes)?;
-                            if range.source_tip != Some((tip_height, tip_hash)) {
+                            if range.source_tip.is_none_or(|(height, hash)| {
+                                height < tip_height || (height == tip_height && hash != tip_hash)
+                            }) {
                                 return Err(PipelineError::SourceChanged);
                             }
                             if cursor < range.retained_body_floor.0 {
@@ -188,6 +200,9 @@ where
                                         expected: cursor,
                                         actual: Some(block.height.0),
                                     });
+                                }
+                                if block.height == tip_height && block.hash != tip_hash {
+                                    return Err(PipelineError::SourceChanged);
                                 }
                                 cursor = cursor.checked_add(1).ok_or(IngestError::Overflow)?;
                                 if raw_tx.send(block).is_err() {
@@ -231,7 +246,7 @@ where
 fn validate_config(config: PipelineConfig) -> Result<(), PipelineError> {
     if config.fetch_workers == 0
         || config.parser_workers == 0
-        || !(1..=MAX_COMPACT_INDEX_SOURCE_BLOCKS).contains(&config.source_segment_blocks)
+        || !(1..=MAX_SOURCE_BLOCKS).contains(&config.source_segment_blocks)
         || config.max_source_bytes < config.fetch_workers
         || config.max_pending_bytes == 0
         || config.max_batch_bytes == 0
@@ -253,7 +268,6 @@ mod tests {
     };
 
     use zakura_chain::{block, transaction};
-    use zakura_state::{CompactIndexSourceRange, RawIndexBlock, RawIndexTransaction};
 
     use super::*;
     use crate::index::BlockId;
@@ -322,7 +336,7 @@ mod tests {
             if count > 0 {
                 active.fetch_sub(1, Ordering::SeqCst);
             }
-            Ok(CompactIndexSourceRange {
+            Ok(SourceRange {
                 blocks,
                 retained_body_floor: block::Height(0),
                 source_tip: Some(tip),
@@ -352,18 +366,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn allows_finalized_tip_to_grow_during_ingestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * MIB, "Mainnet", [9; 32]).unwrap();
+        let calls = AtomicUsize::new(0);
+        let source = |start: u32, count: u32, _max_bytes: usize| {
+            let tip = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                3
+            } else {
+                4
+            };
+            Ok(SourceRange {
+                blocks: (start..start.saturating_add(count))
+                    .map(raw_block)
+                    .collect(),
+                retained_body_floor: block::Height(0),
+                source_tip: Some((block::Height(tip), block::Hash(hash(tip)))),
+            })
+        };
+
+        assert_eq!(
+            sync_historical(&index, source, PipelineConfig::default())
+                .unwrap()
+                .durable_tip(),
+            Some(BlockId::new(3, hash(3)))
+        );
+    }
+
     fn raw_block(height: u32) -> RawIndexBlock {
-        let mut header = vec![0; 140];
-        header[4..36].copy_from_slice(&height.checked_sub(1).map(hash).unwrap_or([0; 32]));
-        header[100..104].copy_from_slice(&height.to_le_bytes());
+        let mut bytes = vec![0; 140];
+        bytes[4..36].copy_from_slice(&height.checked_sub(1).map(hash).unwrap_or([0; 32]));
+        bytes[100..104].copy_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&[0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         RawIndexBlock {
             height: block::Height(height),
             hash: block::Hash(hash(height)),
-            header,
-            transactions: vec![RawIndexTransaction {
-                txid: transaction::Hash(hash(height)),
-                bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            }],
+            bytes,
+            txids: vec![transaction::Hash(hash(height))],
         }
     }
 

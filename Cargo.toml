@@ -15,6 +15,7 @@ tonic-prost = "0.14.6"
 tower = { version = "0.4.13", features = ["util"] }
 zakura-chain = { path = "../zakura/crates/zakura-chain" }
 zakura-state = { path = "../zakura/crates/zakura-state", features = ["indexer"] }
+zakurad = { package = "zakura", path = "../zakura/crates/zakurad", default-features = false }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
