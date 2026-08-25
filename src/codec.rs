@@ -6,6 +6,8 @@ use crate::{
 const BLOCK_FORMAT_VERSION: u8 = 1;
 const RANGE_FORMAT_VERSION: u8 = 1;
 const MAX_RECORD_BYTES: usize = 2_000_000;
+const RECORD_FIXED_BYTES: usize = 93;
+const TRANSACTION_FIXED_BYTES: usize = 56;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TreeSizes {
@@ -43,7 +45,8 @@ pub enum CodecError {
 
 impl CompactBlockRecord {
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        let mut bytes = Vec::new();
+        let encoded_len = encoded_record_len(self.header.len(), &self.transactions)?;
+        let mut bytes = Vec::with_capacity(encoded_len);
         bytes.push(BLOCK_FORMAT_VERSION);
         put_u32(&mut bytes, self.height);
         bytes.extend_from_slice(&self.hash);
@@ -83,9 +86,7 @@ impl CompactBlockRecord {
             }
         }
 
-        if bytes.len() > MAX_RECORD_BYTES {
-            return Err(CodecError::Length);
-        }
+        debug_assert_eq!(bytes.len(), encoded_len);
         Ok(bytes)
     }
 
@@ -179,6 +180,26 @@ impl CompactBlockRecord {
             end_tree_sizes,
         })
     }
+}
+
+pub(crate) fn encoded_record_len(
+    header_len: usize,
+    transactions: &[CompactTransaction],
+) -> Result<usize, CodecError> {
+    let len = transactions.iter().try_fold(
+        RECORD_FIXED_BYTES
+            .checked_add(header_len)
+            .ok_or(CodecError::Length)?,
+        |len, transaction| {
+            len.checked_add(TRANSACTION_FIXED_BYTES)?
+                .checked_add(transaction.sapling_spends.len().checked_mul(32)?)?
+                .checked_add(transaction.sapling_outputs.len().checked_mul(116)?)?
+                .checked_add(transaction.orchard_actions.len().checked_mul(148)?)?
+                .checked_add(transaction.ironwood_actions.len().checked_mul(148)?)
+        },
+    );
+    len.filter(|len| *len <= MAX_RECORD_BYTES)
+        .ok_or(CodecError::Length)
 }
 
 pub fn encode_range(records: &[CompactBlockRecord]) -> Result<Vec<u8>, CodecError> {
