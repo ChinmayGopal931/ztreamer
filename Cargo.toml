@@ -1,0 +1,10 @@
+[package]
+name = "ztreamer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+heed = { version = "0.22.1", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
