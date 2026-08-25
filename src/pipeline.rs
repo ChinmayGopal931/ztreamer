@@ -245,7 +245,10 @@ fn validate_config(config: PipelineConfig) -> Result<(), PipelineError> {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc::{TrySendError, sync_channel},
+        },
         time::Duration,
     };
 
@@ -253,6 +256,43 @@ mod tests {
     use zakura_state::{CompactIndexSourceRange, RawIndexBlock, RawIndexTransaction};
 
     use super::*;
+    use crate::parser::PreparedCompactBlock;
+
+    #[test]
+    fn builder_stays_one_batch_ahead_of_a_blocked_writer() {
+        let mut builder = OrderedBuilder::new(IndexState::default(), MIB).unwrap();
+        for height in 0..3 {
+            builder.push(prepared(height)).unwrap();
+        }
+        let source_tip = BlockId::new(20, hash(20));
+        let first = builder.build_batch(source_tip, 93).unwrap().unwrap();
+        let (batch_tx, batch_rx) = sync_channel::<crate::index::WriteBatch>(1);
+        let (started_tx, started_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+
+        thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let batch = batch_rx.recv().unwrap();
+                assert_eq!(batch.records[0].height, 0);
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+
+            batch_tx.send(first).unwrap();
+            started_rx.recv().unwrap();
+            let second = builder.build_batch(source_tip, 93).unwrap().unwrap();
+            assert_eq!(second.records[0].height, 1);
+            batch_tx.send(second).unwrap();
+            let third = builder.build_batch(source_tip, 93).unwrap().unwrap();
+            assert!(matches!(
+                batch_tx.try_send(third),
+                Err(TrySendError::Full(_))
+            ));
+
+            release_tx.send(()).unwrap();
+            writer.join().unwrap();
+        });
+    }
 
     #[test]
     fn fetches_concurrently_and_commits_in_height_order() {
@@ -315,6 +355,20 @@ mod tests {
                 txid: transaction::Hash(hash(height)),
                 bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             }],
+        }
+    }
+
+    fn prepared(height: u32) -> PreparedCompactBlock {
+        PreparedCompactBlock {
+            height,
+            hash: hash(height),
+            previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
+            time: height,
+            header: Vec::new(),
+            transactions: Vec::new(),
+            sapling_additions: 0,
+            orchard_additions: 0,
+            ironwood_additions: 0,
         }
     }
 

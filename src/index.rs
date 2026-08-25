@@ -479,6 +479,105 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn persistence_and_sealing_use_exact_depth_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        let mut builder = OrderedBuilder::new(IndexState::default(), 10 * 1024 * 1024).unwrap();
+        builder.push(prepared(0)).unwrap();
+
+        assert!(
+            builder
+                .build_batch(BlockId::new(9, hash(9)), 10 * 1024 * 1024)
+                .unwrap()
+                .is_none()
+        );
+        let txn = index.env.read_txn().unwrap();
+        assert!(index.mutable_blocks.get(&txn, &0).unwrap().is_none());
+        drop(txn);
+
+        let state = index
+            .write(
+                builder
+                    .build_batch(BlockId::new(10, hash(10)), 10 * 1024 * 1024)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let txn = index.env.read_txn().unwrap();
+        assert!(index.mutable_blocks.get(&txn, &0).unwrap().is_some());
+        drop(txn);
+
+        let mut builder = OrderedBuilder::new(state, 10 * 1024 * 1024).unwrap();
+        for height in 1..=90 {
+            builder.push(prepared(height)).unwrap();
+        }
+        let state = index
+            .write(
+                builder
+                    .build_batch(BlockId::new(100, hash(100)), 10 * 1024 * 1024)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let txn = index.env.read_txn().unwrap();
+        assert!(index.mutable_blocks.get(&txn, &0).unwrap().is_some());
+        assert!(index.sealed_ranges.get(&txn, &0).unwrap().is_none());
+        drop(txn);
+
+        let mut builder = OrderedBuilder::new(state, 10 * 1024 * 1024).unwrap();
+        for height in 91..RANGE_SIZE {
+            builder.push(prepared(height)).unwrap();
+        }
+        let state = index
+            .write(
+                builder
+                    .build_batch(BlockId::new(1_099, hash(1_099)), 10 * 1024 * 1024)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let txn = index.env.read_txn().unwrap();
+        assert_eq!(state.sealed_through(), Some(999));
+        assert!(index.mutable_blocks.get(&txn, &0).unwrap().is_none());
+        assert!(index.sealed_ranges.get(&txn, &0).unwrap().is_some());
+    }
+
+    #[test]
+    fn aborted_range_pack_keeps_every_mutable_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        let state = index.write(batch(&index, 0..=999, 1_009)).unwrap();
+        assert_eq!(state.durable_tip().unwrap().height, 999);
+
+        let mut txn = index.env.write_txn().unwrap();
+        let records = (0..RANGE_SIZE)
+            .map(|height| {
+                CompactBlockRecord::decode(
+                    index.mutable_blocks.get(&txn, &height).unwrap().unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_range(&records).unwrap();
+        index
+            .sealed_ranges
+            .put(&mut txn, &0, encoded.as_slice())
+            .unwrap();
+        for height in 0..RANGE_SIZE / 2 {
+            index.mutable_blocks.delete(&mut txn, &height).unwrap();
+        }
+        drop(txn); // simulated failure before commit
+
+        let txn = index.env.read_txn().unwrap();
+        assert!(index.sealed_ranges.get(&txn, &0).unwrap().is_none());
+        assert_eq!(index.mutable_blocks.len(&txn).unwrap(), 1_000);
+        assert_eq!(index.hash_to_height.len(&txn).unwrap(), 1_000);
+        drop(txn);
+        assert_eq!(index.state().unwrap(), state);
+        index.verify_continuity().unwrap();
+    }
+
     fn batch(index: &Index, heights: std::ops::RangeInclusive<u32>, source_tip: u32) -> WriteBatch {
         let mut builder = OrderedBuilder::new(index.state().unwrap(), 10 * 1024 * 1024).unwrap();
         for height in heights {
