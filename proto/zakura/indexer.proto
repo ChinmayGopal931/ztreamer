@@ -1,0 +1,19 @@
+syntax = "proto3";
+package zebra.indexer.rpc;
+
+// The subset of Zakura's trusted indexer protocol used by Ztreamer.
+message BlockRequest {
+  // A four-byte big-endian height.
+  bytes hash_or_height = 1;
+}
+
+message BlockAndHash {
+  // The block hash in display order.
+  bytes hash = 1;
+  // The Zcash consensus block serialization.
+  bytes data = 2;
+}
+
+service Indexer {
+  rpc GetBlock(BlockRequest) returns (BlockAndHash);
+}

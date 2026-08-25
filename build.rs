@@ -7,8 +7,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "proto/lightwalletd/compact_formats.proto",
                 "proto/lightwalletd/service.proto",
+                "proto/zakura/indexer.proto",
             ],
-            &["proto/lightwalletd"],
+            &["proto/lightwalletd", "proto/zakura"],
         )?;
     Ok(())
 }

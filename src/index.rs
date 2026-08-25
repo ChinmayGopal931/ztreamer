@@ -92,6 +92,10 @@ pub enum IndexError {
     Coverage { height: u32 },
     #[error("height or generation overflow")]
     Overflow,
+    #[error("ordinary reorg replacement would modify sealed block {height}")]
+    Sealed { height: u32 },
+    #[error("replacement suffix does not connect at height {height}")]
+    Replacement { height: u32 },
 }
 
 /// Ztreamer's four-database LMDB index.
@@ -410,6 +414,172 @@ impl Index {
         state.durable_tip = Some(BlockId::new(last.height, last.hash));
         state.tree_sizes = last.end_tree_sizes;
         self.pack_sealed_ranges(&mut txn, batch.seal_through, &mut state)?;
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or(IndexError::Overflow)?;
+        let encoded = encode_state(state);
+        self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
+        txn.commit()?;
+        Ok(state)
+    }
+
+    /// Atomically replaces every mutable block after `ancestor`.
+    pub fn replace_mutable_suffix(
+        &self,
+        base_generation: u64,
+        ancestor: BlockId,
+        records: Vec<CompactBlockRecord>,
+        seal_through: Option<u32>,
+    ) -> Result<IndexState, IndexError> {
+        let mut txn = self.env.write_txn()?;
+        let mut state = read_state(self.metadata, &txn)?;
+        if state.generation != base_generation {
+            return Err(IndexError::StaleBatch {
+                batch_generation: base_generation,
+            });
+        }
+        if state
+            .sealed_through
+            .is_some_and(|sealed| ancestor.height < sealed)
+        {
+            return Err(IndexError::Sealed {
+                height: ancestor.height + 1,
+            });
+        }
+        let ancestor_record = self.read_record(&txn, state, ancestor.height)?;
+        if ancestor_record.hash != ancestor.hash {
+            return Err(IndexError::Replacement {
+                height: ancestor.height,
+            });
+        }
+
+        let delete_start = ancestor.height.checked_add(1).ok_or(IndexError::Overflow)?;
+        let mut expected_height = delete_start;
+        let mut previous_hash = ancestor.hash;
+        for record in &records {
+            if record.height != expected_height || record.previous_hash != previous_hash {
+                return Err(IndexError::Replacement {
+                    height: expected_height,
+                });
+            }
+            expected_height = expected_height.checked_add(1).ok_or(IndexError::Overflow)?;
+            previous_hash = record.hash;
+        }
+
+        let old_tip = state.durable_tip.ok_or(IndexError::Metadata)?;
+        if ancestor.height > old_tip.height {
+            return Err(IndexError::Replacement {
+                height: ancestor.height,
+            });
+        }
+        for height in delete_start..=old_tip.height {
+            let bytes = self
+                .mutable_blocks
+                .get(&txn, &height)?
+                .ok_or(IndexError::Continuity { height })?;
+            let old = CompactBlockRecord::decode(bytes)?;
+            self.hash_to_height.delete(&mut txn, old.hash.as_slice())?;
+            self.mutable_blocks.delete(&mut txn, &height)?;
+        }
+        for record in &records {
+            let encoded = record.encode()?;
+            self.mutable_blocks
+                .put(&mut txn, &record.height, encoded.as_slice())?;
+            self.hash_to_height
+                .put(&mut txn, record.hash.as_slice(), &record.height)?;
+        }
+
+        let tip = records
+            .last()
+            .map_or(ancestor, |record| BlockId::new(record.height, record.hash));
+        state.durable_tip = Some(tip);
+        state.tree_sizes = records
+            .last()
+            .map_or(ancestor_record.end_tree_sizes, |record| {
+                record.end_tree_sizes
+            });
+        self.pack_sealed_ranges(&mut txn, seal_through, &mut state)?;
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or(IndexError::Overflow)?;
+        let encoded = encode_state(state);
+        self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
+        txn.commit()?;
+        Ok(state)
+    }
+
+    /// Atomically rebuilds every physical range touched by a deep reorg.
+    pub fn replace_deep_suffix(
+        &self,
+        base_generation: u64,
+        common_ancestor: BlockId,
+        replacement: Vec<CompactBlockRecord>,
+        seal_through: Option<u32>,
+    ) -> Result<IndexState, IndexError> {
+        let mut txn = self.env.write_txn()?;
+        let mut state = read_state(self.metadata, &txn)?;
+        if state.generation != base_generation {
+            return Err(IndexError::StaleBatch {
+                batch_generation: base_generation,
+            });
+        }
+        let old_tip = state.durable_tip.ok_or(IndexError::Metadata)?;
+        let common = self.read_record(&txn, state, common_ancestor.height)?;
+        if common.hash != common_ancestor.hash {
+            return Err(IndexError::Replacement {
+                height: common_ancestor.height,
+            });
+        }
+
+        let affected_start = common_ancestor.height - common_ancestor.height % RANGE_SIZE;
+        let old_records = (affected_start..=old_tip.height)
+            .map(|height| self.read_record(&txn, state, height))
+            .collect::<Result<Vec<_>, _>>()?;
+        let prefix_len = (common_ancestor.height - affected_start + 1) as usize;
+        let mut canonical = old_records[..prefix_len].to_vec();
+        canonical.extend(replacement);
+        if canonical.windows(2).any(|pair| {
+            pair[0].height.checked_add(1) != Some(pair[1].height)
+                || pair[1].previous_hash != pair[0].hash
+        }) {
+            return Err(IndexError::Replacement {
+                height: common_ancestor.height,
+            });
+        }
+
+        for record in &old_records {
+            self.hash_to_height
+                .delete(&mut txn, record.hash.as_slice())?;
+            self.mutable_blocks.delete(&mut txn, &record.height)?;
+        }
+        if let Some(old_sealed) = state.sealed_through
+            && affected_start <= old_sealed
+        {
+            let mut start = affected_start;
+            while start <= old_sealed {
+                self.sealed_ranges.delete(&mut txn, &start)?;
+                start = start.checked_add(RANGE_SIZE).ok_or(IndexError::Overflow)?;
+            }
+            state.sealed_through = affected_start
+                .checked_sub(1)
+                .filter(|height| *height <= old_sealed);
+        }
+
+        for record in &canonical {
+            let encoded = record.encode()?;
+            self.mutable_blocks
+                .put(&mut txn, &record.height, encoded.as_slice())?;
+            self.hash_to_height
+                .put(&mut txn, record.hash.as_slice(), &record.height)?;
+        }
+        let tip = canonical
+            .last()
+            .expect("the common-ancestor prefix is non-empty");
+        state.durable_tip = Some(BlockId::new(tip.height, tip.hash));
+        state.tree_sizes = tip.end_tree_sizes;
+        self.pack_sealed_ranges(&mut txn, seal_through, &mut state)?;
         state.generation = state
             .generation
             .checked_add(1)
@@ -747,6 +917,115 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn atomically_replaces_a_mutable_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        let old = index.write(batch(&index, 0..=50, 60)).unwrap();
+        let ancestor = BlockId::new(30, hash(30));
+        let mut previous_hash = ancestor.hash;
+        let replacement = (31..=55)
+            .map(|height| {
+                let record = CompactBlockRecord {
+                    height,
+                    hash: branch_hash(height),
+                    previous_hash,
+                    time: height,
+                    header: Vec::new(),
+                    transactions: Vec::new(),
+                    end_tree_sizes: TreeSizes::default(),
+                };
+                previous_hash = record.hash;
+                record
+            })
+            .collect();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let (state, pinned_hashes) = std::thread::scope(|scope| {
+            let reader_index = &index;
+            let reader = scope.spawn(move || {
+                let mut pinned_hashes = Vec::new();
+                reader_index
+                    .read_range(old.generation(), 29, 32, |block| {
+                        if block.height == 29 {
+                            started_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                        }
+                        pinned_hashes.push(block.hash);
+                        true
+                    })
+                    .unwrap();
+                pinned_hashes
+            });
+            started_rx.recv().unwrap();
+            let state = index
+                .replace_mutable_suffix(old.generation(), ancestor, replacement, None)
+                .unwrap();
+            release_tx.send(()).unwrap();
+            (state, reader.join().unwrap())
+        });
+
+        assert_eq!(state.durable_tip(), Some(BlockId::new(55, branch_hash(55))));
+        assert_eq!(pinned_hashes, [hash(29), hash(30), hash(31), hash(32)]);
+        assert!(
+            index
+                .read_block_by_hash(state.generation(), hash(31))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            index.read_block(state.generation(), 31).unwrap().hash,
+            branch_hash(31)
+        );
+        index.verify_continuity().unwrap();
+    }
+
+    #[test]
+    fn deep_reorg_rebuilds_the_affected_sealed_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 20 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        let old = index.write(batch(&index, 0..=1_100, 1_200)).unwrap();
+        assert_eq!(old.sealed_through(), Some(999));
+
+        let common = BlockId::new(950, hash(950));
+        let mut previous_hash = common.hash;
+        let replacement = (951..=1_110)
+            .map(|height| {
+                let record = CompactBlockRecord {
+                    height,
+                    hash: branch_hash(height),
+                    previous_hash,
+                    time: height,
+                    header: Vec::new(),
+                    transactions: Vec::new(),
+                    end_tree_sizes: TreeSizes::default(),
+                };
+                previous_hash = record.hash;
+                record
+            })
+            .collect();
+        let state = index
+            .replace_deep_suffix(old.generation(), common, replacement, Some(1_010))
+            .unwrap();
+
+        assert_eq!(state.sealed_through(), Some(999));
+        assert_eq!(
+            index.read_block(state.generation(), 950).unwrap().hash,
+            hash(950)
+        );
+        assert_eq!(
+            index.read_block(state.generation(), 951).unwrap().hash,
+            branch_hash(951)
+        );
+        assert!(
+            index
+                .read_block_by_hash(state.generation(), hash(951))
+                .unwrap()
+                .is_none()
+        );
+        index.verify_continuity().unwrap();
+    }
+
     fn batch(index: &Index, heights: std::ops::RangeInclusive<u32>, source_tip: u32) -> WriteBatch {
         let mut builder = OrderedBuilder::new(index.state().unwrap(), 10 * 1024 * 1024).unwrap();
         for height in heights {
@@ -779,6 +1058,12 @@ mod tests {
     fn hash(height: u32) -> [u8; 32] {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&height.to_be_bytes());
+        hash
+    }
+
+    fn branch_hash(height: u32) -> [u8; 32] {
+        let mut hash = hash(height);
+        hash[31] = 1;
         hash
     }
 }

@@ -1,5 +1,6 @@
 pub mod codec;
 pub mod grpc;
+pub mod head;
 pub mod index;
 pub mod ingest;
 pub mod parser;
@@ -12,4 +13,8 @@ pub mod proto {
 
     pub const FILE_DESCRIPTOR_SET: &[u8] =
         tonic::include_file_descriptor_set!("lightwalletd_descriptor");
+}
+
+pub mod zakura_proto {
+    tonic::include_proto!("zebra.indexer.rpc");
 }
