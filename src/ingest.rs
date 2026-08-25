@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     codec::{CodecError, CompactBlockRecord, TreeSizes, encoded_record_len},
-    index::{BlockId, IndexState, PERSIST_DEPTH, WriteBatch},
+    index::{IndexState, WriteBatch},
     parser::PreparedCompactBlock,
 };
 
@@ -79,7 +79,8 @@ impl OrderedBuilder {
     /// Builds one bounded durable batch, leaving gaps and depth-0..9 blocks pending.
     pub fn build_batch(
         &mut self,
-        source_tip: BlockId,
+        durable_through: Option<u32>,
+        seal_through: Option<u32>,
         max_batch_bytes: usize,
     ) -> Result<Option<WriteBatch>, IngestError> {
         let base_generation = self.generation;
@@ -87,9 +88,7 @@ impl OrderedBuilder {
         let mut records = Vec::new();
 
         while let Some((block, bytes)) = self.pending.get(&self.next_height) {
-            if source_tip.height.saturating_sub(block.height) < PERSIST_DEPTH
-                || source_tip.height < block.height
-            {
+            if durable_through.is_none_or(|height| block.height > height) {
                 break;
             }
             if batch_bytes
@@ -169,7 +168,7 @@ impl OrderedBuilder {
             .ok_or(IngestError::Overflow)?;
         Ok(Some(WriteBatch {
             base_generation,
-            source_tip,
+            seal_through,
             records,
         }))
     }
@@ -201,13 +200,13 @@ mod tests {
         builder.push(prepared(1)).unwrap();
         assert!(
             builder
-                .build_batch(BlockId::new(11, hash(11)), 1_000_000)
+                .build_batch(Some(1), None, 1_000_000)
                 .unwrap()
                 .is_none()
         );
         builder.push(first).unwrap();
         let batch = builder
-            .build_batch(BlockId::new(11, hash(11)), 1_000_000)
+            .build_batch(Some(1), None, 1_000_000)
             .unwrap()
             .unwrap();
         assert_eq!(batch.records.len(), 2);

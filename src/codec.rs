@@ -240,49 +240,84 @@ pub fn encode_range(records: &[CompactBlockRecord]) -> Result<Vec<u8>, CodecErro
 }
 
 pub fn decode_range_record(bytes: &[u8], index: usize) -> Result<CompactBlockRecord, CodecError> {
-    if index >= RANGE_SIZE as usize {
-        return Err(CodecError::RangeIndex);
-    }
-    let mut reader = Reader::new(bytes);
-    let version = reader.u8()?;
-    if version != RANGE_FORMAT_VERSION {
-        return Err(CodecError::Version {
-            kind: "range",
-            version,
-        });
-    }
-    let start = reader.u32()?;
-    let end = reader.u32()?;
-    let first_previous_hash = reader.array::<32>()?;
-    let terminal_hash = reader.array::<32>()?;
-    if !start.is_multiple_of(RANGE_SIZE) || start.checked_add(RANGE_SIZE - 1) != Some(end) {
-        return Err(CodecError::InvalidRange);
+    RangeDecoder::new(bytes)?.record(index)
+}
+
+/// Parses a range envelope once, then decodes selected records without allocating an offset table.
+pub(crate) struct RangeDecoder<'a> {
+    start: u32,
+    first_previous_hash: [u8; 32],
+    terminal_hash: [u8; 32],
+    offsets: &'a [u8],
+    body: &'a [u8],
+}
+
+impl<'a> RangeDecoder<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Result<Self, CodecError> {
+        let mut reader = Reader::new(bytes);
+        let version = reader.u8()?;
+        if version != RANGE_FORMAT_VERSION {
+            return Err(CodecError::Version {
+                kind: "range",
+                version,
+            });
+        }
+        let start = reader.u32()?;
+        let end = reader.u32()?;
+        let first_previous_hash = reader.array::<32>()?;
+        let terminal_hash = reader.array::<32>()?;
+        if !start.is_multiple_of(RANGE_SIZE) || start.checked_add(RANGE_SIZE - 1) != Some(end) {
+            return Err(CodecError::InvalidRange);
+        }
+
+        let offsets = reader.take((RANGE_SIZE as usize + 1) * size_of::<u32>())?;
+        let body = reader.take(reader.remaining())?;
+        let decoder = Self {
+            start,
+            first_previous_hash,
+            terminal_hash,
+            offsets,
+            body,
+        };
+        if decoder.offset(0) != 0
+            || decoder.offset(RANGE_SIZE as usize) != body.len()
+            || (1..=RANGE_SIZE as usize)
+                .any(|index| decoder.offset(index - 1) > decoder.offset(index))
+        {
+            return Err(CodecError::Length);
+        }
+        Ok(decoder)
     }
 
-    let offsets = (0..=RANGE_SIZE)
-        .map(|_| reader.u32().map(|offset| offset as usize))
-        .collect::<Result<Vec<_>, _>>()?;
-    let body = reader.take(reader.remaining())?;
-    if offsets[0] != 0
-        || offsets[RANGE_SIZE as usize] != body.len()
-        || offsets.windows(2).any(|pair| pair[0] > pair[1])
-    {
-        return Err(CodecError::Length);
+    pub(crate) fn record(&self, index: usize) -> Result<CompactBlockRecord, CodecError> {
+        if index >= RANGE_SIZE as usize {
+            return Err(CodecError::RangeIndex);
+        }
+        let envelope = self
+            .body
+            .get(self.offset(index)..self.offset(index + 1))
+            .ok_or(CodecError::Length)?;
+        let mut envelope = Reader::new(envelope);
+        let record_len = envelope.len()?;
+        let record = CompactBlockRecord::decode(envelope.take(record_len)?)?;
+        envelope.finish()?;
+        if self.start.checked_add(index as u32) != Some(record.height)
+            || (index == 0 && record.previous_hash != self.first_previous_hash)
+            || (index + 1 == RANGE_SIZE as usize && record.hash != self.terminal_hash)
+        {
+            return Err(CodecError::InvalidRange);
+        }
+        Ok(record)
     }
-    let envelope = body
-        .get(offsets[index]..offsets[index + 1])
-        .ok_or(CodecError::Length)?;
-    let mut envelope = Reader::new(envelope);
-    let record_len = envelope.len()?;
-    let record = CompactBlockRecord::decode(envelope.take(record_len)?)?;
-    envelope.finish()?;
-    if start.checked_add(index as u32) != Some(record.height)
-        || (index == 0 && record.previous_hash != first_previous_hash)
-        || (index + 1 == RANGE_SIZE as usize && record.hash != terminal_hash)
-    {
-        return Err(CodecError::InvalidRange);
+
+    fn offset(&self, index: usize) -> usize {
+        let start = index * size_of::<u32>();
+        u32::from_be_bytes(
+            self.offsets[start..start + size_of::<u32>()]
+                .try_into()
+                .expect("offset table width was checked"),
+        ) as usize
     }
-    Ok(record)
 }
 
 fn put_u32(bytes: &mut Vec<u8>, value: u32) {

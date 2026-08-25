@@ -13,7 +13,7 @@ use zakura_state::{
 };
 
 use crate::{
-    index::{BlockId, Index, IndexError, IndexState, PERSIST_DEPTH},
+    index::{Index, IndexError, IndexState},
     ingest::{IngestError, OrderedBuilder},
     parser::{CompactParseError, parse_block},
 };
@@ -110,14 +110,11 @@ where
     if start < probe.retained_body_floor.0 {
         return Err(PipelineError::MissingBody { height: start });
     }
-    let Some(target) = tip_height.0.checked_sub(PERSIST_DEPTH) else {
-        return Ok(initial_state);
-    };
+    let target = tip_height.0;
     if start > target {
         return Ok(initial_state);
     }
 
-    let source_tip = BlockId::new(tip_height.0, tip_hash.0);
     thread::scope(|scope| {
         let next = Arc::new(AtomicU64::new(u64::from(start)));
         let (raw_tx, raw_rx) = sync_channel(0);
@@ -208,12 +205,15 @@ where
         while let Ok(block) = prepared_rx.recv() {
             builder.push(block)?;
             if builder.pending_bytes() >= config.max_batch_bytes
-                && let Some(batch) = builder.build_batch(source_tip, config.max_batch_bytes)?
+                && let Some(batch) =
+                    builder.build_batch(Some(target), Some(target), config.max_batch_bytes)?
             {
                 batch_tx.send(batch).map_err(|_| PipelineError::Worker)?;
             }
         }
-        while let Some(batch) = builder.build_batch(source_tip, config.max_batch_bytes)? {
+        while let Some(batch) =
+            builder.build_batch(Some(target), Some(target), config.max_batch_bytes)?
+        {
             batch_tx.send(batch).map_err(|_| PipelineError::Worker)?;
         }
         drop(batch_tx);
@@ -256,6 +256,7 @@ mod tests {
     use zakura_state::{CompactIndexSourceRange, RawIndexBlock, RawIndexTransaction};
 
     use super::*;
+    use crate::index::BlockId;
     use crate::parser::PreparedCompactBlock;
 
     #[test]
@@ -264,8 +265,10 @@ mod tests {
         for height in 0..3 {
             builder.push(prepared(height)).unwrap();
         }
-        let source_tip = BlockId::new(20, hash(20));
-        let first = builder.build_batch(source_tip, 93).unwrap().unwrap();
+        let first = builder
+            .build_batch(Some(20), Some(20), 93)
+            .unwrap()
+            .unwrap();
         let (batch_tx, batch_rx) = sync_channel::<crate::index::WriteBatch>(1);
         let (started_tx, started_rx) = sync_channel(0);
         let (release_tx, release_rx) = sync_channel(0);
@@ -280,10 +283,16 @@ mod tests {
 
             batch_tx.send(first).unwrap();
             started_rx.recv().unwrap();
-            let second = builder.build_batch(source_tip, 93).unwrap().unwrap();
+            let second = builder
+                .build_batch(Some(20), Some(20), 93)
+                .unwrap()
+                .unwrap();
             assert_eq!(second.records[0].height, 1);
             batch_tx.send(second).unwrap();
-            let third = builder.build_batch(source_tip, 93).unwrap().unwrap();
+            let third = builder
+                .build_batch(Some(20), Some(20), 93)
+                .unwrap()
+                .unwrap();
             assert!(matches!(
                 batch_tx.try_send(third),
                 Err(TrySendError::Full(_))
@@ -331,7 +340,7 @@ mod tests {
         let state = sync_historical(&index, source, config).unwrap();
 
         assert!(max_active.load(Ordering::SeqCst) > 1);
-        assert_eq!(state.durable_tip(), Some(BlockId::new(10, hash(10))));
+        assert_eq!(state.durable_tip(), Some(BlockId::new(20, hash(20))));
 
         drop(index);
         let index = Index::open(dir.path(), 10 * MIB, "Mainnet", [9; 32]).unwrap();

@@ -6,7 +6,9 @@ use heed::{
     types::{Bytes, U32},
 };
 
-use crate::codec::{CodecError, CompactBlockRecord, TreeSizes, decode_range_record, encode_range};
+use crate::codec::{
+    CodecError, CompactBlockRecord, RangeDecoder, TreeSizes, decode_range_record, encode_range,
+};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const RANGE_SIZE: u32 = 1_000;
@@ -60,7 +62,7 @@ impl IndexState {
 /// A batch whose ordering and cumulative tree sizes were checked by the ordered builder.
 pub struct WriteBatch {
     pub(crate) base_generation: u64,
-    pub(crate) source_tip: BlockId,
+    pub(crate) seal_through: Option<u32>,
     pub(crate) records: Vec<CompactBlockRecord>,
 }
 
@@ -84,6 +86,10 @@ pub enum IndexError {
     Continuity { height: u32 },
     #[error("LMDB hash index does not match compact block at height {height}")]
     HashIndex { height: u32 },
+    #[error("serving snapshot generation {expected} does not match LMDB generation {actual}")]
+    Generation { expected: u64, actual: u64 },
+    #[error("compact block height {height} is outside indexed coverage")]
+    Coverage { height: u32 },
     #[error("height or generation overflow")]
     Overflow,
 }
@@ -141,6 +147,127 @@ impl Index {
     pub fn state(&self) -> Result<IndexState, IndexError> {
         let txn = self.env.read_txn()?;
         read_state(self.metadata, &txn)
+    }
+
+    /// Reads one block from a generation-pinned LMDB snapshot.
+    pub fn read_block(
+        &self,
+        generation: u64,
+        height: u32,
+    ) -> Result<CompactBlockRecord, IndexError> {
+        let txn = self.env.read_txn()?;
+        let state = self.read_generation(&txn, generation)?;
+        self.read_record(&txn, state, height)
+    }
+
+    /// Resolves and reads one canonical block hash from a generation-pinned LMDB snapshot.
+    pub fn read_block_by_hash(
+        &self,
+        generation: u64,
+        hash: [u8; 32],
+    ) -> Result<Option<CompactBlockRecord>, IndexError> {
+        let txn = self.env.read_txn()?;
+        let state = self.read_generation(&txn, generation)?;
+        self.hash_to_height
+            .get(&txn, hash.as_slice())?
+            .map(|height| self.read_record(&txn, state, height))
+            .transpose()
+    }
+
+    /// Incrementally reads an inclusive range under one LMDB read transaction.
+    ///
+    /// Returning `false` from `emit` stops cleanly, allowing a cancelled client to release the
+    /// transaction without decoding the rest of the range.
+    pub fn read_range(
+        &self,
+        generation: u64,
+        start: u32,
+        end: u32,
+        mut emit: impl FnMut(CompactBlockRecord) -> bool,
+    ) -> Result<(), IndexError> {
+        let txn = self.env.read_txn()?;
+        let state = self.read_generation(&txn, generation)?;
+        let tip = state
+            .durable_tip
+            .ok_or(IndexError::Coverage { height: start })?;
+        if start > tip.height {
+            return Err(IndexError::Coverage { height: start });
+        }
+        if end > tip.height {
+            return Err(IndexError::Coverage { height: end });
+        }
+
+        let ascending = start <= end;
+        let mut height = start;
+        loop {
+            if state.sealed_through.is_some_and(|sealed| height <= sealed) {
+                let range_start = height - height % RANGE_SIZE;
+                let bytes = self
+                    .sealed_ranges
+                    .get(&txn, &range_start)?
+                    .ok_or(IndexError::Coverage { height })?;
+                let range = RangeDecoder::new(bytes)?;
+                let chunk_end = if ascending {
+                    end.min(range_start + RANGE_SIZE - 1)
+                } else {
+                    end.max(range_start)
+                };
+                loop {
+                    if !emit(range.record((height - range_start) as usize)?) {
+                        return Ok(());
+                    }
+                    if height == chunk_end {
+                        break;
+                    }
+                    height = if ascending { height + 1 } else { height - 1 };
+                }
+            } else if !emit(self.read_record(&txn, state, height)?) {
+                return Ok(());
+            }
+
+            if height == end {
+                return Ok(());
+            }
+            height = if ascending { height + 1 } else { height - 1 };
+        }
+    }
+
+    fn read_generation(&self, txn: &RoTxn<'_>, generation: u64) -> Result<IndexState, IndexError> {
+        let state = read_state(self.metadata, txn)?;
+        if state.generation != generation {
+            return Err(IndexError::Generation {
+                expected: generation,
+                actual: state.generation,
+            });
+        }
+        Ok(state)
+    }
+
+    fn read_record(
+        &self,
+        txn: &RoTxn<'_>,
+        state: IndexState,
+        height: u32,
+    ) -> Result<CompactBlockRecord, IndexError> {
+        if state.durable_tip.is_none_or(|tip| height > tip.height) {
+            return Err(IndexError::Coverage { height });
+        }
+        if state.sealed_through.is_some_and(|sealed| height <= sealed) {
+            let start = height - height % RANGE_SIZE;
+            return decode_range_record(
+                self.sealed_ranges
+                    .get(txn, &start)?
+                    .ok_or(IndexError::Coverage { height })?,
+                (height - start) as usize,
+            )
+            .map_err(Into::into);
+        }
+        CompactBlockRecord::decode(
+            self.mutable_blocks
+                .get(txn, &height)?
+                .ok_or(IndexError::Coverage { height })?,
+        )
+        .map_err(Into::into)
     }
 
     /// Checks sealed-range summaries and every mutable suffix row without rescanning sealed blocks.
@@ -282,7 +409,7 @@ impl Index {
         let last = batch.records.last().expect("the batch is non-empty");
         state.durable_tip = Some(BlockId::new(last.height, last.hash));
         state.tree_sizes = last.end_tree_sizes;
-        self.pack_sealed_ranges(&mut txn, batch.source_tip.height, &mut state)?;
+        self.pack_sealed_ranges(&mut txn, batch.seal_through, &mut state)?;
         state.generation = state
             .generation
             .checked_add(1)
@@ -296,10 +423,10 @@ impl Index {
     fn pack_sealed_ranges(
         &self,
         txn: &mut RwTxn<'_>,
-        source_tip: u32,
+        seal_cutoff: Option<u32>,
         state: &mut IndexState,
     ) -> Result<(), IndexError> {
-        let Some(seal_cutoff) = source_tip.checked_sub(SEAL_DEPTH) else {
+        let Some(seal_cutoff) = seal_cutoff else {
             return Ok(());
         };
         let mut start = state.sealed_through.map_or(Ok(0), |height| {
@@ -488,7 +615,7 @@ mod tests {
 
         assert!(
             builder
-                .build_batch(BlockId::new(9, hash(9)), 10 * 1024 * 1024)
+                .build_batch(None, None, 10 * 1024 * 1024)
                 .unwrap()
                 .is_none()
         );
@@ -499,7 +626,7 @@ mod tests {
         let state = index
             .write(
                 builder
-                    .build_batch(BlockId::new(10, hash(10)), 10 * 1024 * 1024)
+                    .build_batch(Some(0), None, 10 * 1024 * 1024)
                     .unwrap()
                     .unwrap(),
             )
@@ -515,7 +642,7 @@ mod tests {
         let state = index
             .write(
                 builder
-                    .build_batch(BlockId::new(100, hash(100)), 10 * 1024 * 1024)
+                    .build_batch(Some(90), Some(0), 10 * 1024 * 1024)
                     .unwrap()
                     .unwrap(),
             )
@@ -532,7 +659,7 @@ mod tests {
         let state = index
             .write(
                 builder
-                    .build_batch(BlockId::new(1_099, hash(1_099)), 10 * 1024 * 1024)
+                    .build_batch(Some(1_089), Some(999), 10 * 1024 * 1024)
                     .unwrap()
                     .unwrap(),
             )
@@ -578,13 +705,59 @@ mod tests {
         index.verify_continuity().unwrap();
     }
 
+    #[test]
+    fn reads_sealed_and_mutable_ranges_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        let state = index.write(batch(&index, 0..=1_005, 1_100)).unwrap();
+
+        assert_eq!(
+            index.read_block(state.generation(), 537).unwrap().height,
+            537
+        );
+        assert_eq!(
+            index
+                .read_block_by_hash(state.generation(), hash(1_002))
+                .unwrap()
+                .unwrap()
+                .height,
+            1_002
+        );
+
+        let mut ascending = Vec::new();
+        index
+            .read_range(state.generation(), 998, 1_002, |block| {
+                ascending.push(block.height);
+                true
+            })
+            .unwrap();
+        assert_eq!(ascending, [998, 999, 1_000, 1_001, 1_002]);
+
+        let mut descending = Vec::new();
+        index
+            .read_range(state.generation(), 1_002, 998, |block| {
+                descending.push(block.height);
+                true
+            })
+            .unwrap();
+        assert_eq!(descending, [1_002, 1_001, 1_000, 999, 998]);
+        assert!(matches!(
+            index.read_block(state.generation() - 1, 0),
+            Err(IndexError::Generation { .. })
+        ));
+    }
+
     fn batch(index: &Index, heights: std::ops::RangeInclusive<u32>, source_tip: u32) -> WriteBatch {
         let mut builder = OrderedBuilder::new(index.state().unwrap(), 10 * 1024 * 1024).unwrap();
         for height in heights {
             builder.push(prepared(height)).unwrap();
         }
         builder
-            .build_batch(BlockId::new(source_tip, hash(source_tip)), 10 * 1024 * 1024)
+            .build_batch(
+                source_tip.checked_sub(PERSIST_DEPTH),
+                source_tip.checked_sub(SEAL_DEPTH),
+                10 * 1024 * 1024,
+            )
             .unwrap()
             .unwrap()
     }

@@ -4237,9 +4237,12 @@ dependencies = [
  "prost",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower 0.4.13",
  "zakura-chain",
  "zakura-state",
 ]
