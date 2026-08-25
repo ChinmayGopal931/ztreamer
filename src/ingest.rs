@@ -72,6 +72,10 @@ impl OrderedBuilder {
         Ok(())
     }
 
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
     /// Builds one bounded durable batch, leaving gaps and depth-0..9 blocks pending.
     pub fn build_batch(
         &mut self,

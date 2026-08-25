@@ -2,6 +2,8 @@ pub mod codec;
 pub mod index;
 pub mod ingest;
 pub mod parser;
+pub mod pipeline;
+pub mod source;
 
 pub mod proto {
     tonic::include_proto!("cash.z.wallet.sdk.rpc");

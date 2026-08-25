@@ -6,7 +6,7 @@ use heed::{
     types::{Bytes, U32},
 };
 
-use crate::codec::{CodecError, CompactBlockRecord, TreeSizes, encode_range};
+use crate::codec::{CodecError, CompactBlockRecord, TreeSizes, decode_range_record, encode_range};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const RANGE_SIZE: u32 = 1_000;
@@ -80,6 +80,10 @@ pub enum IndexError {
     StaleBatch { batch_generation: u64 },
     #[error("mutable range starting at {start} is incomplete")]
     IncompleteRange { start: u32 },
+    #[error("LMDB compact coverage is not contiguous at height {height}")]
+    Continuity { height: u32 },
+    #[error("LMDB hash index does not match compact block at height {height}")]
+    HashIndex { height: u32 },
     #[error("height or generation overflow")]
     Overflow,
 }
@@ -123,18 +127,126 @@ impl Index {
         }
         txn.commit()?;
 
-        Ok(Self {
+        let index = Self {
             env,
             metadata,
             sealed_ranges,
             mutable_blocks,
             hash_to_height,
-        })
+        };
+        index.verify_continuity()?;
+        Ok(index)
     }
 
     pub fn state(&self) -> Result<IndexState, IndexError> {
         let txn = self.env.read_txn()?;
         read_state(self.metadata, &txn)
+    }
+
+    /// Checks sealed-range summaries and every mutable suffix row without rescanning sealed blocks.
+    pub fn verify_continuity(&self) -> Result<(), IndexError> {
+        let txn = self.env.read_txn()?;
+        let state = read_state(self.metadata, &txn)?;
+        let Some(tip) = state.durable_tip else {
+            if !self.sealed_ranges.is_empty(&txn)?
+                || !self.mutable_blocks.is_empty(&txn)?
+                || !self.hash_to_height.is_empty(&txn)?
+            {
+                return Err(IndexError::Metadata);
+            }
+            return Ok(());
+        };
+
+        let sealed_blocks = state
+            .sealed_through
+            .map_or(0, |height| u64::from(height) + 1);
+        if self.sealed_ranges.len(&txn)? != sealed_blocks / u64::from(RANGE_SIZE)
+            || self.mutable_blocks.len(&txn)? != u64::from(tip.height) + 1 - sealed_blocks
+            || self.hash_to_height.len(&txn)? != u64::from(tip.height) + 1
+        {
+            return Err(IndexError::Continuity { height: 0 });
+        }
+
+        let mut next_height = 0u64;
+        let mut previous_hash = None;
+        for entry in self.sealed_ranges.iter(&txn)? {
+            let (start, bytes) = entry?;
+            if u64::from(start) != next_height {
+                return Err(IndexError::Continuity {
+                    height: next_height as u32,
+                });
+            }
+            let first = decode_range_record(bytes, 0)?;
+            let last = decode_range_record(bytes, RANGE_SIZE as usize - 1)?;
+            if previous_hash.is_some_and(|hash| first.previous_hash != hash) {
+                return Err(IndexError::Continuity { height: start });
+            }
+            self.verify_hash_entry(&txn, &first)?;
+            self.verify_hash_entry(&txn, &last)?;
+            previous_hash = Some(last.hash);
+            next_height += u64::from(RANGE_SIZE);
+        }
+        if next_height != sealed_blocks {
+            return Err(IndexError::Continuity {
+                height: next_height as u32,
+            });
+        }
+
+        for entry in self.mutable_blocks.iter(&txn)? {
+            let (height, bytes) = entry?;
+            if u64::from(height) != next_height {
+                return Err(IndexError::Continuity {
+                    height: next_height as u32,
+                });
+            }
+            let record = CompactBlockRecord::decode(bytes)?;
+            if record.height != height
+                || previous_hash.is_some_and(|hash| record.previous_hash != hash)
+            {
+                return Err(IndexError::Continuity { height });
+            }
+            self.verify_hash_entry(&txn, &record)?;
+            previous_hash = Some(record.hash);
+            next_height += 1;
+        }
+        let tip_record = if state
+            .sealed_through
+            .is_some_and(|sealed| tip.height <= sealed)
+        {
+            let start = tip.height - tip.height % RANGE_SIZE;
+            decode_range_record(
+                self.sealed_ranges
+                    .get(&txn, &start)?
+                    .ok_or(IndexError::Continuity { height: tip.height })?,
+                (tip.height - start) as usize,
+            )?
+        } else {
+            CompactBlockRecord::decode(
+                self.mutable_blocks
+                    .get(&txn, &tip.height)?
+                    .ok_or(IndexError::Continuity { height: tip.height })?,
+            )?
+        };
+        if next_height != u64::from(tip.height) + 1
+            || previous_hash != Some(tip.hash)
+            || state.tree_sizes != tip_record.end_tree_sizes
+        {
+            return Err(IndexError::Continuity { height: tip.height });
+        }
+        Ok(())
+    }
+
+    fn verify_hash_entry(
+        &self,
+        txn: &RoTxn<'_>,
+        record: &CompactBlockRecord,
+    ) -> Result<(), IndexError> {
+        if self.hash_to_height.get(txn, record.hash.as_slice())? != Some(record.height) {
+            return Err(IndexError::HashIndex {
+                height: record.height,
+            });
+        }
+        Ok(())
     }
 
     /// Atomically writes a batch and packs newly sealed ranges.
@@ -348,6 +460,23 @@ mod tests {
         drop(index);
         let reopened = Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         assert_eq!(reopened.state().unwrap(), state);
+    }
+
+    #[test]
+    fn restart_rejects_a_gap_in_mutable_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        let index = Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
+        index.write(batch(&index, 0..=10, 20)).unwrap();
+        let mut txn = index.env.write_txn().unwrap();
+        index.mutable_blocks.delete(&mut txn, &5).unwrap();
+        txn.commit().unwrap();
+        drop(index);
+
+        assert!(matches!(
+            Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]),
+            Err(IndexError::Continuity { .. })
+        ));
     }
 
     fn batch(index: &Index, heights: std::ops::RangeInclusive<u32>, source_tip: u32) -> WriteBatch {
