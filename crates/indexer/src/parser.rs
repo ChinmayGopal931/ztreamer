@@ -270,20 +270,20 @@ fn parse_transaction_from(
             reader.version_group(SAPLING_GROUP_ID)?;
             reader.transparent_bundle()?;
             reader.skip(16)?;
-            reader.sapling_v4(&mut compact)?;
+            (compact.sapling_spends, compact.sapling_outputs) = reader.sapling_v4()?;
         }
         (5, true) => {
             reader.version_group(V5_GROUP_ID)?;
             reader.skip(12)?;
             reader.transparent_bundle()?;
-            reader.sapling_v5(&mut compact)?;
+            (compact.sapling_spends, compact.sapling_outputs) = reader.sapling_v5()?;
             compact.orchard_actions = reader.actions()?;
         }
         (6, true) => {
             reader.version_group(V6_GROUP_ID)?;
             reader.skip(12)?;
             reader.transparent_bundle()?;
-            reader.sapling_v5(&mut compact)?;
+            (compact.sapling_spends, compact.sapling_outputs) = reader.sapling_v5()?;
             compact.orchard_actions = reader.actions()?;
             compact.ironwood_actions = reader.actions()?;
         }
@@ -429,61 +429,59 @@ impl<'a> Reader<'a> {
 
     fn sapling_v4(
         &mut self,
-        compact: &mut CompactTransaction,
-    ) -> Result<(), TransactionParseError> {
-        let spends = self.count()?;
-        self.ensure_items(spends, SAPLING_V4_SPEND_BYTES)?;
-        compact.sapling_spends.reserve(spends);
-        for _ in 0..spends {
+    ) -> Result<(Vec<[u8; 32]>, Vec<CompactSaplingOutput>), TransactionParseError> {
+        let spend_count = self.count()?;
+        self.ensure_items(spend_count, SAPLING_V4_SPEND_BYTES)?;
+        let mut spends = Vec::with_capacity(spend_count);
+        for _ in 0..spend_count {
             self.skip(64)?;
-            compact.sapling_spends.push(self.array()?);
+            spends.push(self.array()?);
             self.skip(SAPLING_V4_SPEND_BYTES - 96)?;
         }
 
-        let outputs = self.count()?;
-        self.ensure_items(outputs, SAPLING_V4_OUTPUT_BYTES)?;
-        compact.sapling_outputs.reserve(outputs);
-        for _ in 0..outputs {
-            compact.sapling_outputs.push(self.sapling_output(true)?);
+        let output_count = self.count()?;
+        self.ensure_items(output_count, SAPLING_V4_OUTPUT_BYTES)?;
+        let mut outputs = Vec::with_capacity(output_count);
+        for _ in 0..output_count {
+            outputs.push(self.sapling_output(true)?);
         }
 
         self.joinsplits(GROTH16_JOINSPLIT_BYTES)?;
-        if spends > 0 || outputs > 0 {
+        if spend_count > 0 || output_count > 0 {
             self.skip(64)?;
         }
-        Ok(())
+        Ok((spends, outputs))
     }
 
     fn sapling_v5(
         &mut self,
-        compact: &mut CompactTransaction,
-    ) -> Result<(), TransactionParseError> {
-        let spends = self.count()?;
-        self.ensure_items(spends, SAPLING_SPEND_PREFIX_BYTES)?;
-        compact.sapling_spends.reserve(spends);
-        for _ in 0..spends {
+    ) -> Result<(Vec<[u8; 32]>, Vec<CompactSaplingOutput>), TransactionParseError> {
+        let spend_count = self.count()?;
+        self.ensure_items(spend_count, SAPLING_SPEND_PREFIX_BYTES)?;
+        let mut spends = Vec::with_capacity(spend_count);
+        for _ in 0..spend_count {
             self.skip(32)?;
-            compact.sapling_spends.push(self.array()?);
+            spends.push(self.array()?);
             self.skip(SAPLING_SPEND_PREFIX_BYTES - 64)?;
         }
 
-        let outputs = self.count()?;
-        self.ensure_items(outputs, SAPLING_OUTPUT_PREFIX_BYTES)?;
-        compact.sapling_outputs.reserve(outputs);
-        for _ in 0..outputs {
-            compact.sapling_outputs.push(self.sapling_output(false)?);
+        let output_count = self.count()?;
+        self.ensure_items(output_count, SAPLING_OUTPUT_PREFIX_BYTES)?;
+        let mut outputs = Vec::with_capacity(output_count);
+        for _ in 0..output_count {
+            outputs.push(self.sapling_output(false)?);
         }
 
-        if spends > 0 || outputs > 0 {
+        if spend_count > 0 || output_count > 0 {
             self.skip(8)?;
-            if spends > 0 {
+            if spend_count > 0 {
                 self.skip(32)?;
             }
-            self.skip_items(spends, 192 + 64)?;
-            self.skip_items(outputs, 192)?;
+            self.skip_items(spend_count, 192 + 64)?;
+            self.skip_items(output_count, 192)?;
             self.skip(64)?;
         }
-        Ok(())
+        Ok((spends, outputs))
     }
 
     fn sapling_output(
