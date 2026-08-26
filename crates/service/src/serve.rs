@@ -1,9 +1,9 @@
-use crate::{
+use tonic::Status;
+use ztreamer_indexer::{
     codec::CompactBlockRecord,
     parser::{CompactShieldedAction, CompactTransaction},
-    proto,
 };
-use tonic::Status;
+use ztreamer_protocol::proto;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PoolSelection {
@@ -180,7 +180,7 @@ fn convert_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use ztreamer_indexer::{
         codec::TreeSizes,
         parser::{CompactSaplingOutput, CompactShieldedAction},
     };

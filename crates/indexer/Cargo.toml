@@ -1,0 +1,17 @@
+[package]
+name = "ztreamer-indexer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+heed = { version = "0.22.1", default-features = false }
+hex = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tonic = "0.14.6"
+zakura-chain = { path = "../../../zakura/crates/zakura-chain" }
+zakura-state = { path = "../../../zakura/crates/zakura-state", features = ["indexer"] }
+zakurad = { package = "zakura", path = "../../../zakura/crates/zakurad", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

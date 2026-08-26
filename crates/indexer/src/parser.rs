@@ -553,11 +553,11 @@ mod tests {
     };
 
     const SAPLING_BLOCK: &str =
-        include_str!("../../zakura/crates/zakura-test/src/vectors/block-main-0-949-496.txt");
+        include_str!("../../../../zakura/crates/zakura-test/src/vectors/block-main-0-949-496.txt");
     const ORCHARD_BLOCK: &str =
-        include_str!("../../zakura/crates/zakura-test/src/vectors/block-test-1-842-421.txt");
+        include_str!("../../../../zakura/crates/zakura-test/src/vectors/block-test-1-842-421.txt");
     const SAPLING_SPEND_BLOCK: &str =
-        include_str!("../../zakura/crates/zakura-test/src/vectors/block-main-1-687-106.txt");
+        include_str!("../../../../zakura/crates/zakura-test/src/vectors/block-main-1-687-106.txt");
 
     #[test]
     fn selective_parser_matches_full_zakura_parse() {

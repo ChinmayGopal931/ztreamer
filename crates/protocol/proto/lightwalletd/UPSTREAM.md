@@ -19,10 +19,10 @@ Verification:
 
 ```bash
 diff -u \
-  <(perl -pe 's/[ \t]+$//' crates/zinder-proto/proto/compat/lightwalletd/compact_formats.proto) \
+  <(perl -pe 's/[ \t]+$//' crates/protocol/proto/lightwalletd/compact_formats.proto) \
   <(curl -fsSL https://raw.githubusercontent.com/zcash/lightwallet-protocol/ac7cee052a1bf5d430985a478d39e8b513fc4bd4/walletrpc/compact_formats.proto | perl -pe 's/[ \t]+$//')
 
 diff -u \
-  <(perl -pe 's/[ \t]+$//' crates/zinder-proto/proto/compat/lightwalletd/service.proto) \
+  <(perl -pe 's/[ \t]+$//' crates/protocol/proto/lightwalletd/service.proto) \
   <(curl -fsSL https://raw.githubusercontent.com/zcash/lightwallet-protocol/ac7cee052a1bf5d430985a478d39e8b513fc4bd4/walletrpc/service.proto | perl -pe 's/[ \t]+$//')
 ```

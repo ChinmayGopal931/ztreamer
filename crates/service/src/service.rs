@@ -6,20 +6,20 @@ use std::{
 
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
-use tonic::{Request, Response, Status};
+use tonic::Status;
 use tower::ServiceExt;
 use zakura_chain::{block, serialization::ZcashSerialize, subtree::NoteCommitmentSubtreeIndex};
 use zakura_state::{ReadRequest, ReadResponse, ReadStateService};
 
-use crate::{
+use crate::serve::{PoolSelection, compact_block, compact_block_nullifiers};
+use ztreamer_indexer::{
     head::{CanonicalBlockSource, HeadSyncError},
     index::{BlockId, Index, IndexError, IndexState},
     pipeline::PipelineConfig,
-    proto::{self, compact_tx_streamer_server::CompactTxStreamer},
-    serve::{PoolSelection, compact_block, compact_block_nullifiers},
 };
+use ztreamer_protocol::proto;
 
-type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+pub(crate) type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 const MAX_RANGE_READERS: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,7 +27,7 @@ pub struct ServingSnapshot {
     pub generation: u64,
     pub durable_tip: Option<BlockId>,
     pub visible_tip: Option<BlockId>,
-    pub volatile_head: Arc<[crate::codec::CompactBlockRecord]>,
+    pub volatile_head: Arc<[ztreamer_indexer::codec::CompactBlockRecord]>,
     pub ready: bool,
     pub tip_fresh: bool,
     pub last_source_success: Option<Instant>,
@@ -87,7 +87,7 @@ pub enum HeadFollowerError {
 impl ServingSnapshot {
     fn with_head(
         state: IndexState,
-        volatile_head: Vec<crate::codec::CompactBlockRecord>,
+        volatile_head: Vec<ztreamer_indexer::codec::CompactBlockRecord>,
     ) -> Result<Self, SnapshotError> {
         let mut expected_height = state
             .durable_tip()
@@ -118,7 +118,7 @@ impl ServingSnapshot {
         })
     }
 
-    fn volatile(&self, height: u32) -> Option<&crate::codec::CompactBlockRecord> {
+    fn volatile(&self, height: u32) -> Option<&ztreamer_indexer::codec::CompactBlockRecord> {
         self.volatile_head
             .binary_search_by_key(&height, |block| block.height)
             .ok()
@@ -160,7 +160,7 @@ impl CompactService {
     pub fn publish_head(
         &self,
         state: IndexState,
-        volatile_head: Vec<crate::codec::CompactBlockRecord>,
+        volatile_head: Vec<ztreamer_indexer::codec::CompactBlockRecord>,
     ) -> Result<(), SnapshotError> {
         self.snapshot
             .send_replace(ServingSnapshot::with_head(state, volatile_head)?);
@@ -192,8 +192,13 @@ impl CompactService {
         config: PipelineConfig,
     ) -> Result<IndexState, HeadSyncError> {
         let snapshot = self.snapshot();
-        let result =
-            crate::head::sync_head_once(&self.index, source, &snapshot.volatile_head, config).await;
+        let result = ztreamer_indexer::head::sync_head_once(
+            &self.index,
+            source,
+            &snapshot.volatile_head,
+            config,
+        )
+        .await;
         if matches!(result, Err(HeadSyncError::DeepReorg { .. })) {
             self.begin_recovery();
         }
@@ -211,9 +216,13 @@ impl CompactService {
     ) -> Result<IndexState, HeadSyncError> {
         self.begin_recovery();
         let snapshot = self.snapshot();
-        let (state, head) =
-            crate::head::recover_deep_reorg(&self.index, source, &snapshot.volatile_head, config)
-                .await?;
+        let (state, head) = ztreamer_indexer::head::recover_deep_reorg(
+            &self.index,
+            source,
+            &snapshot.volatile_head,
+            config,
+        )
+        .await?;
         self.publish_head(state, head)
             .expect("deep recovery must produce a connected snapshot");
         Ok(state)
@@ -296,7 +305,7 @@ impl CompactService {
     async fn record(
         &self,
         request: proto::BlockId,
-    ) -> Result<crate::codec::CompactBlockRecord, Status> {
+    ) -> Result<ztreamer_indexer::codec::CompactBlockRecord, Status> {
         let snapshot = self.snapshot();
         ensure_ready(&snapshot)?;
         if request.hash.is_empty() {
@@ -341,7 +350,7 @@ impl CompactService {
             .ok_or_else(|| Status::not_found("block is not in the indexed canonical chain"))
     }
 
-    async fn block(
+    pub(crate) async fn block(
         &self,
         request: proto::BlockId,
         nullifiers: bool,
@@ -355,7 +364,7 @@ impl CompactService {
         })
     }
 
-    async fn range(
+    pub(crate) async fn range(
         &self,
         request: proto::BlockRange,
         nullifiers: bool,
@@ -389,7 +398,7 @@ impl CompactService {
         let (sender, receiver) = mpsc::channel(1);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let emit = |record: &crate::codec::CompactBlockRecord| {
+            let emit = |record: &ztreamer_indexer::codec::CompactBlockRecord| {
                 let block = if nullifiers {
                     compact_block_nullifiers(record, pools)
                 } else {
@@ -431,7 +440,10 @@ impl CompactService {
         Ok(Box::pin(ReceiverStream::new(receiver)))
     }
 
-    async fn tree_state(&self, request: proto::BlockId) -> Result<proto::TreeState, Status> {
+    pub(crate) async fn tree_state(
+        &self,
+        request: proto::BlockId,
+    ) -> Result<proto::TreeState, Status> {
         let record = self.record(request).await?;
         let source = self.zakura.clone();
         let hash = block::Hash(record.hash);
@@ -507,101 +519,21 @@ impl CompactService {
         Box::pin(ReceiverStream::new(receiver))
     }
 
-    fn unsupported(method: &'static str) -> Status {
-        Status::unimplemented(format!("Ztreamer does not support {method}"))
-    }
-}
-
-fn emit_volatile(
-    snapshot: &ServingSnapshot,
-    start: u32,
-    end: u32,
-    ascending: bool,
-    emit: &impl Fn(&crate::codec::CompactBlockRecord) -> bool,
-) -> Result<(), IndexError> {
-    if (ascending && start > end) || (!ascending && start < end) {
-        return Ok(());
-    }
-    let mut height = start;
-    loop {
-        let record = snapshot
-            .volatile(height)
-            .ok_or(IndexError::Coverage { height })?;
-        if !emit(record) || height == end {
-            return Ok(());
-        }
-        height = if ascending {
-            height.checked_add(1).ok_or(IndexError::Overflow)?
-        } else {
-            height.checked_sub(1).ok_or(IndexError::Overflow)?
-        };
-    }
-}
-
-#[tonic::async_trait]
-impl CompactTxStreamer for CompactService {
-    type GetBlockRangeStream = RpcStream<proto::CompactBlock>;
-    type GetBlockRangeNullifiersStream = RpcStream<proto::CompactBlock>;
-    type GetTaddressTxidsStream = RpcStream<proto::RawTransaction>;
-    type GetTaddressTransactionsStream = RpcStream<proto::RawTransaction>;
-    type GetMempoolTxStream = RpcStream<proto::CompactTx>;
-    type GetMempoolStreamStream = RpcStream<proto::RawTransaction>;
-    type GetSubtreeRootsStream = RpcStream<proto::SubtreeRoot>;
-    type GetAddressUtxosStreamStream = RpcStream<proto::GetAddressUtxosReply>;
-
-    async fn get_latest_block(
-        &self,
-        _request: Request<proto::ChainSpec>,
-    ) -> Result<Response<proto::BlockId>, Status> {
-        let tip = self.snapshot();
-        ensure_tip_ready(&tip)?;
-        let tip = tip
+    pub(crate) fn latest_block(&self) -> Result<proto::BlockId, Status> {
+        let snapshot = self.snapshot();
+        ensure_tip_ready(&snapshot)?;
+        let tip = snapshot
             .visible_tip
             .ok_or_else(|| Status::unavailable("compact index is empty"))?;
-        Ok(Response::new(proto::BlockId {
+        Ok(proto::BlockId {
             height: u64::from(tip.height),
             hash: tip.hash.to_vec(),
-        }))
+        })
     }
 
-    async fn get_block(
-        &self,
-        request: Request<proto::BlockId>,
-    ) -> Result<Response<proto::CompactBlock>, Status> {
-        Ok(Response::new(
-            self.block(request.into_inner(), false).await?,
-        ))
-    }
-
-    async fn get_block_nullifiers(
-        &self,
-        request: Request<proto::BlockId>,
-    ) -> Result<Response<proto::CompactBlock>, Status> {
-        Ok(Response::new(self.block(request.into_inner(), true).await?))
-    }
-
-    async fn get_block_range(
-        &self,
-        request: Request<proto::BlockRange>,
-    ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
-        Ok(Response::new(
-            self.range(request.into_inner(), false).await?,
-        ))
-    }
-
-    async fn get_block_range_nullifiers(
-        &self,
-        request: Request<proto::BlockRange>,
-    ) -> Result<Response<Self::GetBlockRangeNullifiersStream>, Status> {
-        Ok(Response::new(self.range(request.into_inner(), true).await?))
-    }
-
-    async fn get_lightd_info(
-        &self,
-        _request: Request<proto::Empty>,
-    ) -> Result<Response<proto::LightdInfo>, Status> {
+    pub(crate) fn lightd_info(&self) -> proto::LightdInfo {
         let tip = self.snapshot().visible_tip;
-        Ok(Response::new(proto::LightdInfo {
+        proto::LightdInfo {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             vendor: "Ztreamer".to_owned(),
             taddr_support: false,
@@ -610,22 +542,18 @@ impl CompactTxStreamer for CompactService {
             estimated_height: tip.map_or(0, |tip| u64::from(tip.height)),
             lightwallet_protocol_version: "0.5.0".to_owned(),
             ..Default::default()
-        }))
+        }
     }
 
-    async fn ping(
-        &self,
-        _request: Request<proto::Duration>,
-    ) -> Result<Response<proto::PingResponse>, Status> {
-        Ok(Response::new(proto::PingResponse { entry: 1, exit: 0 }))
+    pub(crate) fn ping(&self) -> proto::PingResponse {
+        proto::PingResponse { entry: 1, exit: 0 }
     }
 
-    async fn get_transaction(
+    pub(crate) async fn transaction(
         &self,
-        request: Request<proto::TxFilter>,
-    ) -> Result<Response<proto::RawTransaction>, Status> {
+        request: proto::TxFilter,
+    ) -> Result<proto::RawTransaction, Status> {
         let hash: [u8; 32] = request
-            .into_inner()
             .hash
             .try_into()
             .map_err(|_| Status::invalid_argument("transaction hash must be 32 bytes"))?;
@@ -644,45 +572,32 @@ impl CompactTxStreamer for CompactService {
             }
             _ => return Err(Status::internal("unexpected transaction response")),
         };
-        Ok(Response::new(proto::RawTransaction {
+        Ok(proto::RawTransaction {
             data: transaction
                 .tx
                 .zcash_serialize_to_vec()
                 .map_err(|error| Status::internal(error.to_string()))?,
             height: u64::from(transaction.height.0),
-        }))
+        })
     }
 
-    async fn get_tree_state(
-        &self,
-        request: Request<proto::BlockId>,
-    ) -> Result<Response<proto::TreeState>, Status> {
-        Ok(Response::new(self.tree_state(request.into_inner()).await?))
-    }
-
-    async fn get_latest_tree_state(
-        &self,
-        _request: Request<proto::Empty>,
-    ) -> Result<Response<proto::TreeState>, Status> {
+    pub(crate) async fn latest_tree_state(&self) -> Result<proto::TreeState, Status> {
         let snapshot = self.snapshot();
         ensure_tip_ready(&snapshot)?;
         let tip = snapshot
             .visible_tip
             .ok_or_else(|| Status::unavailable("compact index is empty"))?;
-        Ok(Response::new(
-            self.tree_state(proto::BlockId {
-                height: u64::from(tip.height),
-                hash: tip.hash.to_vec(),
-            })
-            .await?,
-        ))
+        self.tree_state(proto::BlockId {
+            height: u64::from(tip.height),
+            hash: tip.hash.to_vec(),
+        })
+        .await
     }
 
-    async fn get_subtree_roots(
+    pub(crate) async fn subtree_roots(
         &self,
-        request: Request<proto::GetSubtreeRootsArg>,
-    ) -> Result<Response<Self::GetSubtreeRootsStream>, Status> {
-        let request = request.into_inner();
+        request: proto::GetSubtreeRootsArg,
+    ) -> Result<RpcStream<proto::SubtreeRoot>, Status> {
         let start_index = NoteCommitmentSubtreeIndex(
             request
                 .start_index
@@ -730,71 +645,37 @@ impl CompactTxStreamer for CompactService {
                 .collect(),
             _ => return Err(Status::internal("unexpected subtree response")),
         };
-        let generation = self.snapshot().generation;
-        Ok(Response::new(self.subtree_stream(roots, generation)))
+        Ok(self.subtree_stream(roots, self.snapshot().generation))
     }
 
-    async fn send_transaction(
-        &self,
-        _request: Request<proto::RawTransaction>,
-    ) -> Result<Response<proto::SendResponse>, Status> {
-        Err(Self::unsupported("SendTransaction"))
+    pub(crate) fn unsupported(method: &'static str) -> Status {
+        Status::unimplemented(format!("Ztreamer does not support {method}"))
     }
+}
 
-    async fn get_taddress_txids(
-        &self,
-        _request: Request<proto::TransparentAddressBlockFilter>,
-    ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
-        Err(Self::unsupported("GetTaddressTxids"))
+fn emit_volatile(
+    snapshot: &ServingSnapshot,
+    start: u32,
+    end: u32,
+    ascending: bool,
+    emit: &impl Fn(&ztreamer_indexer::codec::CompactBlockRecord) -> bool,
+) -> Result<(), IndexError> {
+    if (ascending && start > end) || (!ascending && start < end) {
+        return Ok(());
     }
-
-    async fn get_taddress_transactions(
-        &self,
-        _request: Request<proto::TransparentAddressBlockFilter>,
-    ) -> Result<Response<Self::GetTaddressTransactionsStream>, Status> {
-        Err(Self::unsupported("GetTaddressTransactions"))
-    }
-
-    async fn get_taddress_balance(
-        &self,
-        _request: Request<proto::AddressList>,
-    ) -> Result<Response<proto::Balance>, Status> {
-        Err(Self::unsupported("GetTaddressBalance"))
-    }
-
-    async fn get_taddress_balance_stream(
-        &self,
-        _request: Request<tonic::Streaming<proto::Address>>,
-    ) -> Result<Response<proto::Balance>, Status> {
-        Err(Self::unsupported("GetTaddressBalanceStream"))
-    }
-
-    async fn get_mempool_tx(
-        &self,
-        _request: Request<proto::GetMempoolTxRequest>,
-    ) -> Result<Response<Self::GetMempoolTxStream>, Status> {
-        Err(Self::unsupported("GetMempoolTx"))
-    }
-
-    async fn get_mempool_stream(
-        &self,
-        _request: Request<proto::Empty>,
-    ) -> Result<Response<Self::GetMempoolStreamStream>, Status> {
-        Err(Self::unsupported("GetMempoolStream"))
-    }
-
-    async fn get_address_utxos(
-        &self,
-        _request: Request<proto::GetAddressUtxosArg>,
-    ) -> Result<Response<proto::GetAddressUtxosReplyList>, Status> {
-        Err(Self::unsupported("GetAddressUtxos"))
-    }
-
-    async fn get_address_utxos_stream(
-        &self,
-        _request: Request<proto::GetAddressUtxosArg>,
-    ) -> Result<Response<Self::GetAddressUtxosStreamStream>, Status> {
-        Err(Self::unsupported("GetAddressUtxosStream"))
+    let mut height = start;
+    loop {
+        let record = snapshot
+            .volatile(height)
+            .ok_or(IndexError::Coverage { height })?;
+        if !emit(record) || height == end {
+            return Ok(());
+        }
+        height = if ascending {
+            height.checked_add(1).ok_or(IndexError::Overflow)?
+        } else {
+            height.checked_sub(1).ok_or(IndexError::Overflow)?
+        };
     }
 }
 
@@ -848,10 +729,13 @@ fn index_status(error: IndexError) -> Status {
 mod tests {
     use super::*;
     use tokio_stream::StreamExt;
+    use tonic::Request;
     use zakura_chain::{block, parameters::Network, transaction};
     use zakura_state::Config;
+    use ztreamer_protocol::proto::compact_tx_streamer_server::CompactTxStreamer;
 
-    use crate::{
+    use ztreamer_indexer::{
+        head::HeadError,
         parser::RawIndexBlock,
         pipeline::{PipelineConfig, SourceRange, sync_historical},
     };
@@ -860,10 +744,7 @@ mod tests {
 
     #[tonic::async_trait]
     impl CanonicalBlockSource for HeadSource {
-        async fn block(
-            &mut self,
-            height: u32,
-        ) -> Result<Option<RawIndexBlock>, crate::head::HeadError> {
+        async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError> {
             Ok(self.0.get(height as usize).cloned())
         }
     }
@@ -1103,15 +984,15 @@ mod tests {
         }
     }
 
-    fn record(height: u32) -> crate::codec::CompactBlockRecord {
-        crate::codec::CompactBlockRecord {
+    fn record(height: u32) -> ztreamer_indexer::codec::CompactBlockRecord {
+        ztreamer_indexer::codec::CompactBlockRecord {
             height,
             hash: hash(height),
             previous_hash: hash(height - 1),
             time: height,
             header: Vec::new(),
             transactions: Vec::new(),
-            end_tree_sizes: crate::codec::TreeSizes::default(),
+            end_tree_sizes: ztreamer_indexer::codec::TreeSizes::default(),
         }
     }
 

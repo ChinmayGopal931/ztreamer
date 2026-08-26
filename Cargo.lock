@@ -7599,10 +7599,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
-name = "ztreamer"
+name = "ztreamer-indexer"
 version = "0.1.0"
 dependencies = [
  "heed",
+ "hex",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
+ "zakura",
+ "zakura-chain",
+ "zakura-state",
+]
+
+[[package]]
+name = "ztreamer-protocol"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "ztreamer-service"
+version = "0.1.0"
+dependencies = [
  "hex",
  "prost",
  "tempfile",
@@ -7610,10 +7634,10 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-prost",
- "tonic-prost-build",
  "tower 0.4.13",
- "zakura",
  "zakura-chain",
+ "zakura-network",
  "zakura-state",
+ "ztreamer-indexer",
+ "ztreamer-protocol",
 ]
