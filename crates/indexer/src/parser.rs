@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 use zakura_chain::{block, transaction};
 
 const MAX_TRANSACTION_BYTES: usize = 2_000_000;
@@ -27,22 +29,24 @@ pub struct RawIndexBlock {
     pub txids: Vec<transaction::Hash>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactSaplingOutput {
     pub cmu: [u8; 32],
     pub ephemeral_key: [u8; 32],
+    #[serde(with = "BigArray")]
     pub ciphertext: [u8; COMPACT_CIPHERTEXT_BYTES],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactShieldedAction {
     pub nullifier: [u8; 32],
     pub commitment: [u8; 32],
     pub ephemeral_key: [u8; 32],
+    #[serde(with = "BigArray")]
     pub ciphertext: [u8; COMPACT_CIPHERTEXT_BYTES],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactTransaction {
     pub index: u64,
     pub txid: [u8; 32],

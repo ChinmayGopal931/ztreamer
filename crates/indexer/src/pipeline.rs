@@ -270,8 +270,8 @@ mod tests {
     use zakura_chain::{block, transaction};
 
     use super::*;
-    use crate::index::BlockId;
     use crate::parser::PreparedCompactBlock;
+    use crate::{codec::encoded_record_len, index::BlockId};
 
     #[test]
     fn builder_stays_one_batch_ahead_of_a_blocked_writer() {
@@ -279,8 +279,9 @@ mod tests {
         for height in 0..3 {
             builder.push(prepared(height)).unwrap();
         }
+        let batch_bytes = encoded_record_len(&[], &[]).unwrap();
         let first = builder
-            .build_batch(Some(20), Some(20), 93)
+            .build_batch(Some(20), Some(20), batch_bytes)
             .unwrap()
             .unwrap();
         let (batch_tx, batch_rx) = sync_channel::<crate::index::WriteBatch>(1);
@@ -298,13 +299,13 @@ mod tests {
             batch_tx.send(first).unwrap();
             started_rx.recv().unwrap();
             let second = builder
-                .build_batch(Some(20), Some(20), 93)
+                .build_batch(Some(20), Some(20), batch_bytes)
                 .unwrap()
                 .unwrap();
             assert_eq!(second.records[0].height, 1);
             batch_tx.send(second).unwrap();
             let third = builder
-                .build_batch(Some(20), Some(20), 93)
+                .build_batch(Some(20), Some(20), batch_bytes)
                 .unwrap()
                 .unwrap();
             assert!(matches!(

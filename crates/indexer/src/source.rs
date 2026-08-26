@@ -1,6 +1,5 @@
 use zakura_chain::block::Height;
-use zakura_state::{ReadStateService, ZakuraDb};
-use zakurad::node::NodeClient;
+use zakura_state::ZakuraDb;
 
 use crate::{
     index::{Index, IndexState},
@@ -14,22 +13,14 @@ pub enum ZakuraSyncError {
     Pipeline(#[from] PipelineError),
 }
 
-/// In-process access to Zakura's finalized database and state reads.
+/// In-process access to Zakura's finalized database.
 pub struct ZakuraSource {
-    read_service: ReadStateService,
     db: ZakuraDb,
 }
 
 impl ZakuraSource {
-    pub fn new(client: &NodeClient) -> Self {
-        Self {
-            read_service: client.read_state(),
-            db: client.database(),
-        }
-    }
-
-    pub fn read_service(&self) -> ReadStateService {
-        self.read_service.clone()
+    pub fn new(db: ZakuraDb) -> Self {
+        Self { db }
     }
 
     pub fn sync(

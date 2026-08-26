@@ -1,22 +1,20 @@
-use crate::{
-    index::RANGE_SIZE,
-    parser::{CompactSaplingOutput, CompactShieldedAction, CompactTransaction},
-};
+use bincode::Options;
+use serde::{Deserialize, Serialize};
+
+use crate::{index::RANGE_SIZE, parser::CompactTransaction};
 
 const BLOCK_FORMAT_VERSION: u8 = 1;
 const RANGE_FORMAT_VERSION: u8 = 1;
 const MAX_RECORD_BYTES: usize = 2_000_000;
-const RECORD_FIXED_BYTES: usize = 93;
-const TRANSACTION_FIXED_BYTES: usize = 56;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TreeSizes {
     pub sapling: u32,
     pub orchard: u32,
     pub ironwood: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactBlockRecord {
     pub height: u32,
     pub hash: [u8; 32],
@@ -37,6 +35,8 @@ pub enum CodecError {
     Length,
     #[error("encoded value has trailing bytes")]
     TrailingBytes,
+    #[error("encoded block record is invalid")]
+    InvalidRecord,
     #[error("range must contain exactly {RANGE_SIZE} contiguous aligned blocks")]
     InvalidRange,
     #[error("range record index is outside 0..{RANGE_SIZE}")]
@@ -45,161 +45,66 @@ pub enum CodecError {
 
 impl CompactBlockRecord {
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        let encoded_len = encoded_record_len(self.header.len(), &self.transactions)?;
-        let mut bytes = Vec::with_capacity(encoded_len);
-        bytes.push(BLOCK_FORMAT_VERSION);
-        put_u32(&mut bytes, self.height);
-        bytes.extend_from_slice(&self.hash);
-        bytes.extend_from_slice(&self.previous_hash);
-        put_u32(&mut bytes, self.time);
-        put_u32(&mut bytes, self.end_tree_sizes.sapling);
-        put_u32(&mut bytes, self.end_tree_sizes.orchard);
-        put_u32(&mut bytes, self.end_tree_sizes.ironwood);
-        put_len(&mut bytes, self.header.len())?;
-        put_len(&mut bytes, self.transactions.len())?;
-        bytes.extend_from_slice(&self.header);
-
-        for transaction in &self.transactions {
-            put_u64(&mut bytes, transaction.index);
-            bytes.extend_from_slice(&transaction.txid);
-            put_len(&mut bytes, transaction.sapling_spends.len())?;
-            put_len(&mut bytes, transaction.sapling_outputs.len())?;
-            put_len(&mut bytes, transaction.orchard_actions.len())?;
-            put_len(&mut bytes, transaction.ironwood_actions.len())?;
-            for nullifier in &transaction.sapling_spends {
-                bytes.extend_from_slice(nullifier);
-            }
-            for output in &transaction.sapling_outputs {
-                bytes.extend_from_slice(&output.cmu);
-                bytes.extend_from_slice(&output.ephemeral_key);
-                bytes.extend_from_slice(&output.ciphertext);
-            }
-            for action in transaction
-                .orchard_actions
-                .iter()
-                .chain(&transaction.ironwood_actions)
-            {
-                bytes.extend_from_slice(&action.nullifier);
-                bytes.extend_from_slice(&action.commitment);
-                bytes.extend_from_slice(&action.ephemeral_key);
-                bytes.extend_from_slice(&action.ciphertext);
-            }
-        }
-
-        debug_assert_eq!(bytes.len(), encoded_len);
-        Ok(bytes)
+        record_options()
+            .serialize(&(BLOCK_FORMAT_VERSION, self))
+            .map_err(|_| CodecError::Length)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(CodecError::Length);
         }
-        let mut reader = Reader::new(bytes);
-        let version = reader.u8()?;
+        let (version, record) = record_options()
+            .deserialize::<(u8, Self)>(bytes)
+            .map_err(|_| CodecError::InvalidRecord)?;
         if version != BLOCK_FORMAT_VERSION {
             return Err(CodecError::Version {
                 kind: "block",
                 version,
             });
         }
-        let height = reader.u32()?;
-        let hash = reader.array()?;
-        let previous_hash = reader.array()?;
-        let time = reader.u32()?;
-        let end_tree_sizes = TreeSizes {
-            sapling: reader.u32()?,
-            orchard: reader.u32()?,
-            ironwood: reader.u32()?,
-        };
-        let header_len = reader.len()?;
-        let transaction_count = reader.len()?;
-        let header = reader.take(header_len)?.to_vec();
-        let mut transactions = Vec::with_capacity(reader.bounded_count(transaction_count, 56)?);
-
-        for _ in 0..transaction_count {
-            let index = reader.u64()?;
-            let txid = reader.array()?;
-            let spends = reader.len()?;
-            let outputs = reader.len()?;
-            let orchard = reader.len()?;
-            let ironwood = reader.len()?;
-            let required = spends
-                .checked_mul(32)
-                .and_then(|n| n.checked_add(outputs.checked_mul(116)?))
-                .and_then(|n| n.checked_add(orchard.checked_mul(148)?))
-                .and_then(|n| n.checked_add(ironwood.checked_mul(148)?))
-                .ok_or(CodecError::Length)?;
-            if required > reader.remaining() {
-                return Err(CodecError::Truncated);
-            }
-
-            let sapling_spends = (0..spends)
-                .map(|_| reader.array())
-                .collect::<Result<_, _>>()?;
-            let sapling_outputs = (0..outputs)
-                .map(|_| {
-                    Ok(CompactSaplingOutput {
-                        cmu: reader.array()?,
-                        ephemeral_key: reader.array()?,
-                        ciphertext: reader.array()?,
-                    })
-                })
-                .collect::<Result<_, CodecError>>()?;
-            let mut read_actions = |count| {
-                (0..count)
-                    .map(|_| {
-                        Ok(CompactShieldedAction {
-                            nullifier: reader.array()?,
-                            commitment: reader.array()?,
-                            ephemeral_key: reader.array()?,
-                            ciphertext: reader.array()?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, CodecError>>()
-            };
-            let orchard_actions = read_actions(orchard)?;
-            let ironwood_actions = read_actions(ironwood)?;
-            transactions.push(CompactTransaction {
-                index,
-                txid,
-                sapling_spends,
-                sapling_outputs,
-                orchard_actions,
-                ironwood_actions,
-            });
-        }
-        reader.finish()?;
-
-        Ok(Self {
-            height,
-            hash,
-            previous_hash,
-            time,
-            header,
-            transactions,
-            end_tree_sizes,
-        })
+        Ok(record)
     }
 }
 
 pub(crate) fn encoded_record_len(
-    header_len: usize,
+    header: &[u8],
     transactions: &[CompactTransaction],
 ) -> Result<usize, CodecError> {
-    let len = transactions.iter().try_fold(
-        RECORD_FIXED_BYTES
-            .checked_add(header_len)
-            .ok_or(CodecError::Length)?,
-        |len, transaction| {
-            len.checked_add(TRANSACTION_FIXED_BYTES)?
-                .checked_add(transaction.sapling_spends.len().checked_mul(32)?)?
-                .checked_add(transaction.sapling_outputs.len().checked_mul(116)?)?
-                .checked_add(transaction.orchard_actions.len().checked_mul(148)?)?
-                .checked_add(transaction.ironwood_actions.len().checked_mul(148)?)
-        },
-    );
-    len.filter(|len| *len <= MAX_RECORD_BYTES)
+    #[derive(Serialize)]
+    struct RecordRef<'a> {
+        height: u32,
+        hash: [u8; 32],
+        previous_hash: [u8; 32],
+        time: u32,
+        header: &'a [u8],
+        transactions: &'a [CompactTransaction],
+        end_tree_sizes: TreeSizes,
+    }
+
+    let record = RecordRef {
+        height: 0,
+        hash: [0; 32],
+        previous_hash: [0; 32],
+        time: 0,
+        header,
+        transactions,
+        end_tree_sizes: TreeSizes::default(),
+    };
+    record_options()
+        .serialized_size(&(BLOCK_FORMAT_VERSION, record))
+        .ok()
+        .and_then(|len| usize::try_from(len).ok())
+        .filter(|len| *len <= MAX_RECORD_BYTES)
         .ok_or(CodecError::Length)
+}
+
+fn record_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_big_endian()
+        .with_limit(MAX_RECORD_BYTES as u64)
+        .reject_trailing_bytes()
 }
 
 pub fn encode_range(records: &[CompactBlockRecord]) -> Result<Vec<u8>, CodecError> {
@@ -324,10 +229,6 @@ fn put_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_be_bytes());
 }
 
-fn put_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_be_bytes());
-}
-
 fn put_len(bytes: &mut Vec<u8>, value: usize) -> Result<(), CodecError> {
     put_u32(bytes, value.try_into().map_err(|_| CodecError::Length)?);
     Ok(())
@@ -369,19 +270,8 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes(self.array()?))
     }
 
-    fn u64(&mut self) -> Result<u64, CodecError> {
-        Ok(u64::from_be_bytes(self.array()?))
-    }
-
     fn len(&mut self) -> Result<usize, CodecError> {
         Ok(self.u32()? as usize)
-    }
-
-    fn bounded_count(&self, count: usize, minimum_size: usize) -> Result<usize, CodecError> {
-        if count.checked_mul(minimum_size).ok_or(CodecError::Length)? > self.remaining() {
-            return Err(CodecError::Truncated);
-        }
-        Ok(count)
     }
 
     fn finish(self) -> Result<(), CodecError> {
@@ -396,6 +286,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::{CompactSaplingOutput, CompactShieldedAction};
 
     #[test]
     fn block_and_range_round_trip() {
@@ -424,9 +315,23 @@ mod tests {
                 ironwood: 1,
             },
         };
+        let encoded_first = first.encode().unwrap();
         assert_eq!(
-            CompactBlockRecord::decode(&first.encode().unwrap()).unwrap(),
-            first
+            encoded_first.len(),
+            encoded_record_len(&first.header, &first.transactions).unwrap()
+        );
+        assert_eq!(CompactBlockRecord::decode(&encoded_first).unwrap(), first);
+        assert_eq!(
+            CompactBlockRecord::decode(&[encoded_first, vec![0]].concat()),
+            Err(CodecError::InvalidRecord)
+        );
+        assert_eq!(
+            CompactBlockRecord::decode(&vec![0; MAX_RECORD_BYTES + 1]),
+            Err(CodecError::Length)
+        );
+        assert_eq!(
+            CompactBlockRecord::decode(&[0xff; 81]),
+            Err(CodecError::InvalidRecord)
         );
 
         let mut records = vec![first];

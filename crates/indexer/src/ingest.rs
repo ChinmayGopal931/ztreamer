@@ -57,7 +57,7 @@ impl OrderedBuilder {
                 height: block.height,
             });
         }
-        let bytes = encoded_record_len(block.header.len(), &block.transactions)?;
+        let bytes = encoded_record_len(&block.header, &block.transactions)?;
         let pending_bytes = self
             .pending_bytes
             .checked_add(bytes)
