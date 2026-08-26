@@ -271,7 +271,7 @@ mod tests {
 
     use super::*;
     use crate::parser::PreparedCompactBlock;
-    use crate::{codec::encoded_record_len, index::BlockId};
+    use crate::{Digest, codec::encoded_record_len, index::BlockId};
 
     #[test]
     fn builder_stays_one_batch_ahead_of_a_blocked_writer() {
@@ -422,7 +422,7 @@ mod tests {
         }
     }
 
-    fn hash(height: u32) -> [u8; 32] {
+    fn hash(height: u32) -> Digest {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&height.to_be_bytes());
         hash

@@ -13,6 +13,7 @@ use zakura_state::{ReadRequest, ReadResponse, ReadStateService};
 
 use crate::serve::{PoolSelection, compact_block, compact_block_nullifiers};
 use ztreamer_indexer::{
+    Digest,
     head::{CanonicalBlockSource, HeadSyncError},
     index::{BlockId, Index, IndexError, IndexState},
     pipeline::PipelineConfig,
@@ -316,7 +317,7 @@ impl CompactService {
                 return Ok(record.clone());
             }
         } else {
-            let hash: [u8; 32] = request
+            let hash: Digest = request
                 .hash
                 .as_slice()
                 .try_into()
@@ -337,7 +338,7 @@ impl CompactService {
                 .map_err(|_| Status::invalid_argument("block height exceeds u32"))?;
             tokio::task::spawn_blocking(move || index.read_block(generation, height).map(Some))
         } else {
-            let hash: [u8; 32] = request
+            let hash: Digest = request
                 .hash
                 .try_into()
                 .map_err(|_| Status::invalid_argument("block hash must be 32 bytes"))?;
@@ -553,7 +554,7 @@ impl CompactService {
         &self,
         request: proto::TxFilter,
     ) -> Result<proto::RawTransaction, Status> {
-        let hash: [u8; 32] = request
+        let hash: Digest = request
             .hash
             .try_into()
             .map_err(|_| Status::invalid_argument("transaction hash must be 32 bytes"))?;
@@ -996,7 +997,7 @@ mod tests {
         }
     }
 
-    fn hash(height: u32) -> [u8; 32] {
+    fn hash(height: u32) -> Digest {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&height.to_be_bytes());
         hash

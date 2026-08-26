@@ -6,6 +6,7 @@ use heed::{
     types::{Bytes, U32},
 };
 
+use crate::Digest;
 use crate::codec::{
     CodecError, CompactBlockRecord, RangeDecoder, TreeSizes, decode_range_record, encode_range,
 };
@@ -24,11 +25,11 @@ type HeightDb = Database<U32<BigEndian>, Bytes>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockId {
     pub height: u32,
-    pub hash: [u8; 32],
+    pub hash: Digest,
 }
 
 impl BlockId {
-    pub const fn new(height: u32, hash: [u8; 32]) -> Self {
+    pub const fn new(height: u32, hash: Digest) -> Self {
         Self { height, hash }
     }
 }
@@ -113,7 +114,7 @@ impl Index {
         path: impl AsRef<Path>,
         map_size: usize,
         network: &str,
-        genesis_hash: [u8; 32],
+        genesis_hash: Digest,
     ) -> Result<Self, IndexError> {
         fs::create_dir_all(path.as_ref())?;
         // SAFETY: callers must not open this path with incompatible LMDB options in this process.
@@ -168,7 +169,7 @@ impl Index {
     pub fn read_block_by_hash(
         &self,
         generation: u64,
-        hash: [u8; 32],
+        hash: Digest,
     ) -> Result<Option<CompactBlockRecord>, IndexError> {
         let txn = self.env.read_txn()?;
         let state = self.read_generation(&txn, generation)?;
@@ -693,7 +694,7 @@ fn decode_state(bytes: &[u8]) -> Result<IndexState, IndexError> {
     })
 }
 
-fn identity(network: &str, genesis_hash: [u8; 32]) -> Vec<u8> {
+fn identity(network: &str, genesis_hash: Digest) -> Vec<u8> {
     [
         SCHEMA_VERSION.to_be_bytes().as_slice(),
         RANGE_SIZE.to_be_bytes().as_slice(),
@@ -1055,13 +1056,13 @@ mod tests {
         }
     }
 
-    fn hash(height: u32) -> [u8; 32] {
+    fn hash(height: u32) -> Digest {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&height.to_be_bytes());
         hash
     }
 
-    fn branch_hash(height: u32) -> [u8; 32] {
+    fn branch_hash(height: u32) -> Digest {
         let mut hash = hash(height);
         hash[31] = 1;
         hash

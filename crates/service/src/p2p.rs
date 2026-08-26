@@ -322,6 +322,7 @@ mod tests {
     use zakura_network::zakura::framed_channel;
     use zakura_state::Config;
     use ztreamer_indexer::{
+        Digest,
         codec::{CompactBlockRecord, TreeSizes},
         index::{Index, IndexState},
     };
@@ -390,7 +391,7 @@ mod tests {
         assert!(end.payload.is_empty());
     }
 
-    fn record(height: u32, hash: [u8; 32], previous_hash: [u8; 32]) -> CompactBlockRecord {
+    fn record(height: u32, hash: Digest, previous_hash: Digest) -> CompactBlockRecord {
         CompactBlockRecord {
             height,
             hash,

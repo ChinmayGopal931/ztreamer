@@ -1,7 +1,7 @@
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
-use crate::{index::RANGE_SIZE, parser::CompactTransaction};
+use crate::{Digest, index::RANGE_SIZE, parser::CompactTransaction};
 
 const BLOCK_FORMAT_VERSION: u8 = 1;
 const RANGE_FORMAT_VERSION: u8 = 1;
@@ -17,8 +17,8 @@ pub struct TreeSizes {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactBlockRecord {
     pub height: u32,
-    pub hash: [u8; 32],
-    pub previous_hash: [u8; 32],
+    pub hash: Digest,
+    pub previous_hash: Digest,
     pub time: u32,
     pub header: Vec<u8>,
     pub transactions: Vec<CompactTransaction>,
@@ -74,8 +74,8 @@ pub(crate) fn encoded_record_len(
     #[derive(Serialize)]
     struct RecordRef<'a> {
         height: u32,
-        hash: [u8; 32],
-        previous_hash: [u8; 32],
+        hash: Digest,
+        previous_hash: Digest,
         time: u32,
         header: &'a [u8],
         transactions: &'a [CompactTransaction],
@@ -151,8 +151,8 @@ pub fn decode_range_record(bytes: &[u8], index: usize) -> Result<CompactBlockRec
 /// Parses a range envelope once, then decodes selected records without allocating an offset table.
 pub(crate) struct RangeDecoder<'a> {
     start: u32,
-    first_previous_hash: [u8; 32],
-    terminal_hash: [u8; 32],
+    first_previous_hash: Digest,
+    terminal_hash: Digest,
     offsets: &'a [u8],
     body: &'a [u8],
 }
@@ -362,7 +362,7 @@ mod tests {
         }
     }
 
-    fn hash(height: u32) -> [u8; 32] {
+    fn hash(height: u32) -> Digest {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&height.to_be_bytes());
         hash

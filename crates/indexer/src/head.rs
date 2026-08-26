@@ -6,6 +6,7 @@ use zakura_state::MAX_BLOCK_REORG_HEIGHT;
 use zakurad::node::NodeClient;
 
 use crate::{
+    Digest,
     codec::CompactBlockRecord,
     index::{Index, IndexError, IndexState, PERSIST_DEPTH, SEAL_DEPTH},
     ingest::{IngestError, OrderedBuilder},
@@ -99,7 +100,7 @@ impl CanonicalBlockSource for NodeClient {
 pub async fn poll_canonical_head(
     source: &mut impl CanonicalBlockSource,
     start: u32,
-    previous_hash: [u8; 32],
+    previous_hash: Digest,
 ) -> Result<Vec<PreparedCompactBlock>, HeadError> {
     if let Some(anchor_height) = start.checked_sub(1) {
         let anchor = source
@@ -122,7 +123,7 @@ pub async fn poll_canonical_head(
         if raw.len() == MAX_BLOCK_REORG_HEIGHT as usize {
             return Err(HeadError::Window);
         }
-        let parent: [u8; 32] = block
+        let parent: Digest = block
             .bytes
             .get(4..36)
             .and_then(|bytes| bytes.try_into().ok())
@@ -534,13 +535,13 @@ mod tests {
         block
     }
 
-    fn hash(height: u32) -> [u8; 32] {
+    fn hash(height: u32) -> Digest {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&height.to_be_bytes());
         hash
     }
 
-    fn branch_hash(height: u32) -> [u8; 32] {
+    fn branch_hash(height: u32) -> Digest {
         let mut hash = hash(height);
         hash[31] = 1;
         hash

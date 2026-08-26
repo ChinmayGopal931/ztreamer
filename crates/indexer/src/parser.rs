@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use zakura_chain::{block, transaction};
 
+use crate::{Ciphertext, Digest};
+
 const MAX_TRANSACTION_BYTES: usize = 2_000_000;
 const MAX_VECTOR_ITEMS: usize = u16::MAX as usize;
 const MAX_EQUIHASH_SOLUTION_BYTES: usize = 1_344;
@@ -31,26 +33,26 @@ pub struct RawIndexBlock {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactSaplingOutput {
-    pub cmu: [u8; 32],
-    pub ephemeral_key: [u8; 32],
+    pub cmu: Digest,
+    pub ephemeral_key: Digest,
     #[serde(with = "BigArray")]
-    pub ciphertext: [u8; COMPACT_CIPHERTEXT_BYTES],
+    pub ciphertext: Ciphertext,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactShieldedAction {
-    pub nullifier: [u8; 32],
-    pub commitment: [u8; 32],
-    pub ephemeral_key: [u8; 32],
+    pub nullifier: Digest,
+    pub commitment: Digest,
+    pub ephemeral_key: Digest,
     #[serde(with = "BigArray")]
-    pub ciphertext: [u8; COMPACT_CIPHERTEXT_BYTES],
+    pub ciphertext: Ciphertext,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactTransaction {
     pub index: u64,
-    pub txid: [u8; 32],
-    pub sapling_spends: Vec<[u8; 32]>,
+    pub txid: Digest,
+    pub sapling_spends: Vec<Digest>,
     pub sapling_outputs: Vec<CompactSaplingOutput>,
     pub orchard_actions: Vec<CompactShieldedAction>,
     pub ironwood_actions: Vec<CompactShieldedAction>,
@@ -68,8 +70,8 @@ impl CompactTransaction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedCompactBlock {
     pub height: u32,
-    pub hash: [u8; 32],
-    pub previous_hash: [u8; 32],
+    pub hash: Digest,
+    pub previous_hash: Digest,
     pub time: u32,
     pub header: Vec<u8>,
     pub transactions: Vec<CompactTransaction>,
@@ -429,7 +431,7 @@ impl<'a> Reader<'a> {
 
     fn sapling_v4(
         &mut self,
-    ) -> Result<(Vec<[u8; 32]>, Vec<CompactSaplingOutput>), TransactionParseError> {
+    ) -> Result<(Vec<Digest>, Vec<CompactSaplingOutput>), TransactionParseError> {
         let spend_count = self.count()?;
         self.ensure_items(spend_count, SAPLING_V4_SPEND_BYTES)?;
         let mut spends = Vec::with_capacity(spend_count);
@@ -455,7 +457,7 @@ impl<'a> Reader<'a> {
 
     fn sapling_v5(
         &mut self,
-    ) -> Result<(Vec<[u8; 32]>, Vec<CompactSaplingOutput>), TransactionParseError> {
+    ) -> Result<(Vec<Digest>, Vec<CompactSaplingOutput>), TransactionParseError> {
         let spend_count = self.count()?;
         self.ensure_items(spend_count, SAPLING_SPEND_PREFIX_BYTES)?;
         let mut spends = Vec::with_capacity(spend_count);

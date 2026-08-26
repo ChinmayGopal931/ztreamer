@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::{
+    Digest,
     codec::{CodecError, CompactBlockRecord, TreeSizes, encoded_record_len},
     index::{IndexState, WriteBatch},
     parser::PreparedCompactBlock,
@@ -27,7 +28,7 @@ pub enum IngestError {
 /// Restores parser output to canonical height order under a byte budget.
 pub struct OrderedBuilder {
     next_height: u32,
-    previous_hash: Option<[u8; 32]>,
+    previous_hash: Option<Digest>,
     tree_sizes: TreeSizes,
     generation: u64,
     pending: BTreeMap<u32, (PreparedCompactBlock, usize)>,
@@ -229,7 +230,7 @@ mod tests {
         }
     }
 
-    fn hash(height: u32) -> [u8; 32] {
+    fn hash(height: u32) -> Digest {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&height.to_be_bytes());
         hash
