@@ -146,6 +146,7 @@ impl Index {
             hash_to_height,
         };
         index.verify_continuity()?;
+        record_state_metrics(index.state()?);
         Ok(index)
     }
 
@@ -422,6 +423,7 @@ impl Index {
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
         txn.commit()?;
+        record_state_metrics(state);
         Ok(state)
     }
 
@@ -508,6 +510,7 @@ impl Index {
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
         txn.commit()?;
+        record_state_metrics(state);
         Ok(state)
     }
 
@@ -588,6 +591,7 @@ impl Index {
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
         txn.commit()?;
+        record_state_metrics(state);
         Ok(state)
     }
 
@@ -634,6 +638,14 @@ impl Index {
         }
         Ok(())
     }
+}
+
+fn record_state_metrics(state: IndexState) {
+    metrics::gauge!("ztreamer.index.durable.block.height")
+        .set(state.durable_tip.map_or(f64::NAN, |tip| tip.height.into()));
+    metrics::gauge!("ztreamer.index.sealed.block.height")
+        .set(state.sealed_through.map_or(f64::NAN, Into::into));
+    metrics::gauge!("ztreamer.index.generation").set(state.generation as f64);
 }
 
 fn read_state(metadata: Database<Bytes, Bytes>, txn: &RoTxn<'_>) -> Result<IndexState, IndexError> {

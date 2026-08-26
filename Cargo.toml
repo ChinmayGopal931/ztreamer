@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["crates/indexer", "crates/protocol", "crates/service"]
+members = ["bin/ztreamerd", "crates/indexer", "crates/protocol", "crates/service"]

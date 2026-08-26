@@ -1,0 +1,16 @@
+[package]
+name = "ztreamerd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = "0.14.6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zakurad = { package = "zakura", path = "../../../zakura/crates/zakurad", default-features = false, features = ["prometheus"] }
+ztreamer-indexer = { path = "../../crates/indexer" }
+ztreamer-protocol = { path = "../../crates/protocol" }
+ztreamer-service = { path = "../../crates/service" }
