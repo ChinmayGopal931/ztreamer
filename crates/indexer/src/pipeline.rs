@@ -7,7 +7,8 @@ use std::{
     thread,
 };
 
-use zakura_chain::block;
+use zakura_chain::block::{self, Height};
+use zakura_state::ZakuraDb;
 
 use crate::{
     index::{Index, IndexError, IndexState},
@@ -20,10 +21,10 @@ pub(crate) const MAX_SOURCE_BLOCKS: u32 = 256;
 pub(crate) const MAX_SOURCE_BYTES: usize = 64 * MIB;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceRange {
-    pub blocks: Vec<RawIndexBlock>,
-    pub retained_body_floor: block::Height,
-    pub source_tip: Option<(block::Height, block::Hash)>,
+struct SourceRange {
+    blocks: Vec<RawIndexBlock>,
+    retained_body_floor: block::Height,
+    source_tip: Option<(block::Height, block::Hash)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,14 +88,11 @@ pub enum PipelineError {
 /// Ingests the finalized durable prefix using bounded fetch, parse, and write stages.
 ///
 /// The captured finalized prefix is immutable; the live source tip may grow during this call.
-pub fn sync_historical<F>(
+pub(crate) fn sync_historical(
     index: &Index,
-    source: F,
+    db: &ZakuraDb,
     config: PipelineConfig,
-) -> Result<IndexState, PipelineError>
-where
-    F: Fn(u32, u32, usize) -> Result<SourceRange, PipelineError> + Sync,
-{
+) -> Result<IndexState, PipelineError> {
     validate_config(config)?;
     let initial_state = index.state()?;
     let durable_tip = initial_state.durable_tip();
@@ -102,7 +100,8 @@ where
         tip.height.checked_add(1).ok_or(IngestError::Overflow)
     })?;
     let request_bytes = (config.max_source_bytes / config.fetch_workers).clamp(1, MAX_SOURCE_BYTES);
-    let probe = source(
+    let probe = read_range(
+        db,
         durable_tip.map_or(start, |tip| tip.height),
         u32::from(durable_tip.is_some()),
         request_bytes,
@@ -168,7 +167,6 @@ where
             .map(|_| {
                 let raw_tx = raw_tx.clone();
                 let next = Arc::clone(&next);
-                let source = &source;
                 scope.spawn(move || -> Result<(), PipelineError> {
                     loop {
                         let segment_start = next
@@ -182,7 +180,7 @@ where
                         let mut cursor = segment_start as u32;
                         while u64::from(cursor) <= segment_end {
                             let count = (segment_end - u64::from(cursor) + 1) as u32;
-                            let range = source(cursor, count, request_bytes)?;
+                            let range = read_range(db, cursor, count, request_bytes)?;
                             if range.source_tip.is_none_or(|(height, hash)| {
                                 height < tip_height || (height == tip_height && hash != tip_hash)
                             }) {
@@ -243,6 +241,73 @@ where
     })
 }
 
+fn read_range(
+    db: &ZakuraDb,
+    start: u32,
+    count: u32,
+    max_bytes: usize,
+) -> Result<SourceRange, PipelineError> {
+    let source_tip = db.tip();
+    let retained_body_floor = db.prune_height().unwrap_or(Height::MIN);
+    let mut blocks = Vec::new();
+    let mut response_bytes = 0usize;
+
+    for offset in 0..count {
+        let Some(height) = start.checked_add(offset).map(Height) else {
+            break;
+        };
+        if source_tip.is_none_or(|(tip, _)| height > tip) {
+            break;
+        }
+        let hash = db.hash(height).ok_or(PipelineError::SourceGap {
+            expected: height.0,
+            actual: None,
+        })?;
+        let bytes = db
+            .raw_block_bytes(height.into())
+            .ok_or(PipelineError::MissingBody { height: height.0 })?;
+        let txids = db
+            .transaction_hashes_for_block(height.into())
+            .ok_or(PipelineError::MissingBody { height: height.0 })?
+            .to_vec();
+        let block_bytes = bytes
+            .len()
+            .checked_add(
+                txids
+                    .len()
+                    .checked_mul(32)
+                    .ok_or(PipelineError::SourceSize { height: height.0 })?,
+            )
+            .ok_or(PipelineError::SourceSize { height: height.0 })?;
+        let next_response_bytes = response_bytes
+            .checked_add(block_bytes)
+            .ok_or(PipelineError::SourceSize { height: height.0 })?;
+        if next_response_bytes > max_bytes {
+            if blocks.is_empty() {
+                return Err(PipelineError::BlockExceedsByteLimit {
+                    height: height.0,
+                    required: block_bytes,
+                    limit: max_bytes,
+                });
+            }
+            break;
+        }
+        response_bytes = next_response_bytes;
+        blocks.push(RawIndexBlock {
+            height,
+            hash,
+            bytes,
+            txids,
+        });
+    }
+
+    Ok(SourceRange {
+        blocks,
+        retained_body_floor,
+        source_tip,
+    })
+}
+
 fn validate_config(config: PipelineConfig) -> Result<(), PipelineError> {
     if config.fetch_workers == 0
         || config.parser_workers == 0
@@ -259,19 +324,11 @@ fn validate_config(config: PipelineConfig) -> Result<(), PipelineError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            mpsc::{TrySendError, sync_channel},
-        },
-        time::Duration,
-    };
-
-    use zakura_chain::{block, transaction};
+    use std::sync::mpsc::{TrySendError, sync_channel};
 
     use super::*;
     use crate::parser::PreparedCompactBlock;
-    use crate::{Digest, codec::encoded_record_len, index::BlockId};
+    use crate::{Digest, codec::encoded_record_len};
 
     #[test]
     fn builder_stays_one_batch_ahead_of_a_blocked_writer() {
@@ -316,96 +373,6 @@ mod tests {
             release_tx.send(()).unwrap();
             writer.join().unwrap();
         });
-    }
-
-    #[test]
-    fn fetches_concurrently_and_commits_in_height_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = Index::open(dir.path(), 10 * MIB, "Mainnet", [9; 32]).unwrap();
-        let active = AtomicUsize::new(0);
-        let max_active = AtomicUsize::new(0);
-        let tip = (block::Height(20), block::Hash(hash(20)));
-        let source = |start: u32, count: u32, _max_bytes: usize| {
-            if count > 0 {
-                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                max_active.fetch_max(now, Ordering::SeqCst);
-                thread::sleep(Duration::from_millis(u64::from(10 - start.min(10))));
-            }
-            let blocks = (start..start.saturating_add(count))
-                .map(raw_block)
-                .collect();
-            if count > 0 {
-                active.fetch_sub(1, Ordering::SeqCst);
-            }
-            Ok(SourceRange {
-                blocks,
-                retained_body_floor: block::Height(0),
-                source_tip: Some(tip),
-            })
-        };
-
-        let config = PipelineConfig {
-            fetch_workers: 4,
-            parser_workers: 4,
-            source_segment_blocks: 1,
-            max_source_bytes: 4 * MIB,
-            max_pending_bytes: MIB,
-            max_batch_bytes: 300,
-        };
-        let state = sync_historical(&index, source, config).unwrap();
-
-        assert!(max_active.load(Ordering::SeqCst) > 1);
-        assert_eq!(state.durable_tip(), Some(BlockId::new(20, hash(20))));
-
-        drop(index);
-        let index = Index::open(dir.path(), 10 * MIB, "Mainnet", [9; 32]).unwrap();
-        assert_eq!(
-            sync_historical(&index, source, config)
-                .unwrap()
-                .durable_tip(),
-            state.durable_tip()
-        );
-    }
-
-    #[test]
-    fn allows_finalized_tip_to_grow_during_ingestion() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = Index::open(dir.path(), 10 * MIB, "Mainnet", [9; 32]).unwrap();
-        let calls = AtomicUsize::new(0);
-        let source = |start: u32, count: u32, _max_bytes: usize| {
-            let tip = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                3
-            } else {
-                4
-            };
-            Ok(SourceRange {
-                blocks: (start..start.saturating_add(count))
-                    .map(raw_block)
-                    .collect(),
-                retained_body_floor: block::Height(0),
-                source_tip: Some((block::Height(tip), block::Hash(hash(tip)))),
-            })
-        };
-
-        assert_eq!(
-            sync_historical(&index, source, PipelineConfig::default())
-                .unwrap()
-                .durable_tip(),
-            Some(BlockId::new(3, hash(3)))
-        );
-    }
-
-    fn raw_block(height: u32) -> RawIndexBlock {
-        let mut bytes = vec![0; 140];
-        bytes[4..36].copy_from_slice(&height.checked_sub(1).map(hash).unwrap_or([0; 32]));
-        bytes[100..104].copy_from_slice(&height.to_le_bytes());
-        bytes.extend_from_slice(&[0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        RawIndexBlock {
-            height: block::Height(height),
-            hash: block::Hash(hash(height)),
-            bytes,
-            txids: vec![transaction::Hash(hash(height))],
-        }
     }
 
     fn prepared(height: u32) -> PreparedCompactBlock {

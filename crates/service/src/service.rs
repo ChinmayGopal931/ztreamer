@@ -737,8 +737,9 @@ mod tests {
 
     use ztreamer_indexer::{
         head::HeadError,
-        parser::RawIndexBlock,
-        pipeline::{PipelineConfig, SourceRange, sync_historical},
+        ingest::OrderedBuilder,
+        parser::{PreparedCompactBlock, RawIndexBlock},
+        pipeline::PipelineConfig,
     };
 
     struct HeadSource(Vec<RawIndexBlock>);
@@ -812,26 +813,7 @@ mod tests {
                 let index = Arc::new(
                     Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap(),
                 );
-                let tip = (block::Height(1_005), block::Hash(hash(1_005)));
-                let state = sync_historical(
-                    &index,
-                    |start, count, _| {
-                        Ok(SourceRange {
-                            blocks: (start..start + count).map(raw_block).collect(),
-                            retained_body_floor: block::Height(0),
-                            source_tip: Some(tip),
-                        })
-                    },
-                    PipelineConfig {
-                        fetch_workers: 2,
-                        parser_workers: 2,
-                        source_segment_blocks: 64,
-                        max_source_bytes: 1024 * 1024,
-                        max_pending_bytes: 1024 * 1024,
-                        max_batch_bytes: 1024 * 1024,
-                    },
-                )
-                .unwrap();
+                let state = index_through(&index, 1_005);
                 let (_state_service, read_service, _tip, _change) = zakura_state::init(
                     Config::ephemeral(),
                     &Network::Mainnet,
@@ -995,6 +977,33 @@ mod tests {
             transactions: Vec::new(),
             end_tree_sizes: ztreamer_indexer::codec::TreeSizes::default(),
         }
+    }
+
+    fn index_through(index: &Index, tip: u32) -> IndexState {
+        let mut builder = OrderedBuilder::new(IndexState::default(), 1024 * 1024).unwrap();
+        for height in 0..=tip {
+            builder
+                .push(PreparedCompactBlock {
+                    height,
+                    hash: hash(height),
+                    previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
+                    time: height,
+                    header: Vec::new(),
+                    transactions: Vec::new(),
+                    sapling_additions: 0,
+                    orchard_additions: 0,
+                    ironwood_additions: 0,
+                })
+                .unwrap();
+        }
+        let mut state = IndexState::default();
+        while let Some(batch) = builder
+            .build_batch(Some(tip), Some(tip), 1024 * 1024)
+            .unwrap()
+        {
+            state = index.write(batch).unwrap();
+        }
+        state
     }
 
     fn hash(height: u32) -> Digest {
