@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroUsize},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -31,6 +37,18 @@ struct Cli {
     /// Historical Zakura fetch workers. Defaults to the pipeline setting.
     #[arg(long)]
     fetch_workers: Option<NonZeroUsize>,
+
+    /// Consecutive blocks scanned by each historical fetch worker.
+    #[arg(long)]
+    source_segment_blocks: Option<NonZeroU32>,
+
+    /// Maximum bytes awaiting ordered historical ingestion.
+    #[arg(long)]
+    max_pending_bytes: Option<NonZeroUsize>,
+
+    /// Maximum compact-index write batch size in bytes.
+    #[arg(long)]
+    max_batch_bytes: Option<NonZeroUsize>,
 
     /// CompactTxStreamer gRPC listener.
     #[arg(long, default_value = "127.0.0.1:9067")]
@@ -110,6 +128,15 @@ async fn main() -> Result<()> {
     let mut pipeline = PipelineConfig::default();
     if let Some(fetch_workers) = cli.fetch_workers {
         pipeline.fetch_workers = fetch_workers.get();
+    }
+    if let Some(source_segment_blocks) = cli.source_segment_blocks {
+        pipeline.source_segment_blocks = source_segment_blocks.get();
+    }
+    if let Some(max_pending_bytes) = cli.max_pending_bytes {
+        pipeline.max_pending_bytes = max_pending_bytes.get();
+    }
+    if let Some(max_batch_bytes) = cli.max_batch_bytes {
+        pipeline.max_batch_bytes = max_batch_bytes.get();
     }
     info!("syncing historical compact index");
     let historical_started = Instant::now();

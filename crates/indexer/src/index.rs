@@ -386,36 +386,81 @@ impl Index {
     pub fn write(&self, batch: WriteBatch) -> Result<IndexState, IndexError> {
         let mut txn = self.env.write_txn()?;
         let mut state = read_state(self.metadata, &txn)?;
-        let first = batch
-            .records
-            .first()
-            .expect("builders never emit empty batches");
+        let WriteBatch {
+            base_generation,
+            seal_through,
+            records,
+        } = batch;
+        let first = records.first().expect("builders never emit empty batches");
         let expected_height = match state.durable_tip {
             Some(tip) => tip.height.checked_add(1).ok_or(IndexError::Overflow)?,
             None => 0,
         };
-        if state.generation != batch.base_generation
+        if state.generation != base_generation
             || first.height != expected_height
             || state
                 .durable_tip
                 .is_some_and(|tip| first.previous_hash != tip.hash)
         {
             return Err(IndexError::StaleBatch {
-                batch_generation: batch.base_generation,
+                batch_generation: base_generation,
             });
         }
 
-        for record in &batch.records {
-            let encoded = record.encode()?;
-            self.mutable_blocks
-                .put(&mut txn, &record.height, encoded.as_slice())?;
+        for record in &records {
             self.hash_to_height
                 .put(&mut txn, record.hash.as_slice(), &record.height)?;
         }
-        let last = batch.records.last().expect("the batch is non-empty");
-        state.durable_tip = Some(BlockId::new(last.height, last.hash));
-        state.tree_sizes = last.end_tree_sizes;
-        self.pack_sealed_ranges(&mut txn, batch.seal_through, &mut state)?;
+        let last = records.last().expect("the batch is non-empty");
+        let tip = BlockId::new(last.height, last.hash);
+        let tree_sizes = last.end_tree_sizes;
+        let mut records = records.into_iter().peekable();
+        let mut start = state.sealed_through.map_or(Ok(0), |height| {
+            height.checked_add(1).ok_or(IndexError::Overflow)
+        })?;
+
+        while let Some(seal_cutoff) = seal_through {
+            let end = start
+                .checked_add(RANGE_SIZE - 1)
+                .ok_or(IndexError::Overflow)?;
+            if end > seal_cutoff || end > tip.height {
+                break;
+            }
+            let first_new = records.peek().map_or(end + 1, |record| record.height);
+            if first_new > end + 1 {
+                return Err(IndexError::IncompleteRange { start });
+            }
+            let mut range = (start..first_new)
+                .map(|height| {
+                    self.mutable_blocks
+                        .get(&txn, &height)?
+                        .ok_or(IndexError::IncompleteRange { start })
+                        .and_then(|bytes| CompactBlockRecord::decode(bytes).map_err(Into::into))
+                })
+                .collect::<Result<Vec<_>, IndexError>>()?;
+            while range.len() < RANGE_SIZE as usize {
+                range.push(
+                    records
+                        .next()
+                        .ok_or(IndexError::IncompleteRange { start })?,
+                );
+            }
+            let encoded = encode_range(&range)?;
+            self.sealed_ranges
+                .put(&mut txn, &start, encoded.as_slice())?;
+            for height in start..first_new {
+                self.mutable_blocks.delete(&mut txn, &height)?;
+            }
+            state.sealed_through = Some(end);
+            start = end.checked_add(1).ok_or(IndexError::Overflow)?;
+        }
+        for record in records {
+            let encoded = record.encode()?;
+            self.mutable_blocks
+                .put(&mut txn, &record.height, encoded.as_slice())?;
+        }
+        state.durable_tip = Some(tip);
+        state.tree_sizes = tree_sizes;
         state.generation = state
             .generation
             .checked_add(1)

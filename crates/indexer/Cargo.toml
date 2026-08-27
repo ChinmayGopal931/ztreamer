@@ -13,6 +13,7 @@ serde-big-array = "0.5"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tonic = "0.14.6"
+tracing = "0.1"
 zakura-chain = { path = "../../../zakura/crates/zakura-chain" }
 zakura-state = { path = "../../../zakura/crates/zakura-state", features = ["indexer"] }
 zakurad = { package = "zakura", path = "../../../zakura/crates/zakurad", default-features = false }

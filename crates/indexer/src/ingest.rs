@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::{
     Digest,
     codec::{CodecError, CompactBlockRecord, TreeSizes, encoded_record_len},
-    index::{IndexState, WriteBatch},
+    index::{IndexState, RANGE_SIZE, WriteBatch},
     parser::PreparedCompactBlock,
 };
 
@@ -33,21 +33,26 @@ pub struct OrderedBuilder {
     generation: u64,
     pending: BTreeMap<u32, (PreparedCompactBlock, usize)>,
     pending_bytes: usize,
+    ready_end: u64,
+    ready_bytes: usize,
     max_pending_bytes: usize,
 }
 
 impl OrderedBuilder {
     pub fn new(state: IndexState, max_pending_bytes: usize) -> Result<Self, IngestError> {
+        let next_height = match state.durable_tip {
+            Some(tip) => tip.height.checked_add(1).ok_or(IngestError::Overflow)?,
+            None => 0,
+        };
         Ok(Self {
-            next_height: match state.durable_tip {
-                Some(tip) => tip.height.checked_add(1).ok_or(IngestError::Overflow)?,
-                None => 0,
-            },
+            next_height,
             previous_hash: state.durable_tip.map(|tip| tip.hash),
             tree_sizes: state.tree_sizes,
             generation: state.generation,
             pending: BTreeMap::new(),
             pending_bytes: 0,
+            ready_end: u64::from(next_height),
+            ready_bytes: 0,
             max_pending_bytes,
         })
     }
@@ -69,12 +74,24 @@ impl OrderedBuilder {
             });
         }
         self.pending_bytes = pending_bytes;
-        self.pending.insert(block.height, (block, bytes));
+        let height = block.height;
+        self.pending.insert(height, (block, bytes));
+        if u64::from(height) == self.ready_end {
+            while let Ok(height) = self.ready_end.try_into()
+                && let Some((_, bytes)) = self.pending.get(&height)
+            {
+                self.ready_bytes = self
+                    .ready_bytes
+                    .checked_add(*bytes)
+                    .ok_or(IngestError::Overflow)?;
+                self.ready_end += 1;
+            }
+        }
         Ok(())
     }
 
-    pub(crate) fn pending_bytes(&self) -> usize {
-        self.pending_bytes
+    pub(crate) fn ready_bytes(&self) -> usize {
+        self.ready_bytes
     }
 
     /// Builds one bounded durable batch, leaving gaps and depth-0..9 blocks pending.
@@ -84,6 +101,16 @@ impl OrderedBuilder {
         seal_through: Option<u32>,
         max_batch_bytes: usize,
     ) -> Result<Option<WriteBatch>, IngestError> {
+        let range_end = self
+            .next_height
+            .checked_add(RANGE_SIZE - 1 - self.next_height % RANGE_SIZE)
+            .ok_or(IngestError::Overflow)?;
+        if seal_through.is_some_and(|height| range_end <= height)
+            && self.ready_end <= u64::from(range_end)
+            && self.pending_bytes <= self.max_pending_bytes.saturating_sub(max_batch_bytes)
+        {
+            return Ok(None);
+        }
         let base_generation = self.generation;
         let mut batch_bytes = 0usize;
         let mut records = Vec::new();
@@ -102,7 +129,15 @@ impl OrderedBuilder {
                         limit: max_batch_bytes,
                     });
                 }
-                break;
+                let range_end = block
+                    .height
+                    .checked_add(RANGE_SIZE - 1 - block.height % RANGE_SIZE)
+                    .ok_or(IngestError::Overflow)?;
+                if block.height.is_multiple_of(RANGE_SIZE)
+                    || seal_through.is_none_or(|height| range_end > height)
+                {
+                    break;
+                }
             }
             if self
                 .previous_hash
@@ -146,6 +181,7 @@ impl OrderedBuilder {
 
             batch_bytes += bytes;
             self.pending_bytes -= bytes;
+            self.ready_bytes -= bytes;
             self.next_height = next_height;
             self.previous_hash = Some(block.hash);
             self.tree_sizes = end_tree_sizes;
@@ -214,6 +250,49 @@ mod tests {
         assert_eq!(batch.records[0].height, 0);
         assert_eq!(batch.records[1].height, 1);
         assert_eq!(batch.records[1].end_tree_sizes.sapling, 1);
+    }
+
+    #[test]
+    fn ready_bytes_exclude_blocks_beyond_a_gap() {
+        let bytes = encoded_record_len(&[], &[]).unwrap();
+        let mut builder = OrderedBuilder::new(IndexState::default(), 1_000_000).unwrap();
+
+        builder.push(prepared(1)).unwrap();
+        builder.push(prepared(2)).unwrap();
+        assert_eq!(builder.ready_bytes(), 0);
+
+        builder.push(prepared(0)).unwrap();
+        assert_eq!(builder.ready_bytes(), 3 * bytes);
+        let batch = builder
+            .build_batch(Some(2), None, 2 * bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.records.len(), 2);
+        assert_eq!(builder.ready_bytes(), bytes);
+    }
+
+    #[test]
+    fn sealable_ranges_stay_in_one_batch() {
+        let bytes = encoded_record_len(&[], &[]).unwrap();
+        let mut builder = OrderedBuilder::new(IndexState::default(), 1_000_000).unwrap();
+        for height in 0..RANGE_SIZE / 2 {
+            builder.push(prepared(height)).unwrap();
+        }
+        assert!(
+            builder
+                .build_batch(Some(RANGE_SIZE - 1), Some(RANGE_SIZE - 1), 2 * bytes)
+                .unwrap()
+                .is_none()
+        );
+        for height in RANGE_SIZE / 2..RANGE_SIZE {
+            builder.push(prepared(height)).unwrap();
+        }
+
+        let batch = builder
+            .build_batch(Some(RANGE_SIZE - 1), Some(RANGE_SIZE - 1), 2 * bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.records.len(), RANGE_SIZE as usize);
     }
 
     fn prepared(height: u32) -> PreparedCompactBlock {

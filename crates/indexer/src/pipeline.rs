@@ -2,13 +2,18 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
-        mpsc::sync_channel,
+        mpsc::{SyncSender, sync_channel},
     },
     thread,
+    time::{Duration, Instant},
 };
+use tracing::info;
 
-use zakura_chain::block::{self, Height};
-use zakura_state::ZakuraDb;
+use zakura_chain::{
+    block::{self, Height},
+    serialization::{CompactSizeMessage, ZcashSerialize},
+};
+use zakura_state::{TransactionLocation, ZakuraDb};
 
 use crate::{
     index::{Index, IndexError, IndexState},
@@ -17,7 +22,7 @@ use crate::{
 };
 
 const MIB: usize = 1024 * 1024;
-pub(crate) const MAX_SOURCE_BLOCKS: u32 = 256;
+pub(crate) const MAX_SOURCE_BLOCKS: u32 = 4096;
 pub(crate) const MAX_SOURCE_BYTES: usize = 64 * MIB;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,6 +30,49 @@ struct SourceRange {
     blocks: Vec<RawIndexBlock>,
     retained_body_floor: block::Height,
     source_tip: Option<(block::Height, block::Hash)>,
+}
+
+#[derive(Default)]
+struct FetchStats {
+    read: Duration,
+    header_read: Duration,
+    transaction_read: Duration,
+    txid_read: Duration,
+    assemble: Duration,
+    send_wait: Duration,
+    ranges: u64,
+    blocks: u64,
+    bytes: u64,
+}
+
+impl FetchStats {
+    fn add(&mut self, other: Self) {
+        self.read += other.read;
+        self.header_read += other.header_read;
+        self.transaction_read += other.transaction_read;
+        self.txid_read += other.txid_read;
+        self.assemble += other.assemble;
+        self.send_wait += other.send_wait;
+        self.ranges += other.ranges;
+        self.blocks += other.blocks;
+        self.bytes += other.bytes;
+    }
+}
+
+#[derive(Default)]
+struct ParseStats {
+    receive_wait: Duration,
+    parse: Duration,
+    send_wait: Duration,
+    blocks: u64,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct WriteStats {
+    write: Duration,
+    batches: u64,
+    blocks: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -41,11 +89,11 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         let workers = thread::available_parallelism().map_or(1, usize::from);
         Self {
-            fetch_workers: workers.min(4),
+            fetch_workers: workers.min(8),
             parser_workers: workers,
-            source_segment_blocks: 64,
+            source_segment_blocks: 256,
             max_source_bytes: 64 * MIB,
-            max_pending_bytes: 64 * MIB,
+            max_pending_bytes: 256 * MIB,
             max_batch_bytes: 16 * MIB,
         }
     }
@@ -126,37 +174,51 @@ pub(crate) fn sync_historical(
 
     thread::scope(|scope| {
         let next = Arc::new(AtomicU64::new(u64::from(start)));
-        let (raw_tx, raw_rx) = sync_channel(0);
+        let (raw_tx, raw_rx) = sync_channel::<RawIndexBlock>(0);
         let raw_rx = Arc::new(Mutex::new(raw_rx));
-        let (prepared_tx, prepared_rx) = sync_channel(0);
-        let (batch_tx, batch_rx) = sync_channel(1);
+        let (prepared_tx, prepared_rx) = sync_channel::<crate::parser::PreparedCompactBlock>(0);
+        let (batch_tx, batch_rx) = sync_channel::<crate::index::WriteBatch>(1);
         let writer = scope.spawn(move || {
-            let mut result = Ok(initial_state);
+            let mut result: Result<IndexState, PipelineError> = Ok(initial_state);
+            let mut stats = WriteStats::default();
             while let Ok(batch) = batch_rx.recv() {
                 if let Ok(state) = &mut result {
+                    stats.batches += 1;
+                    stats.blocks += batch.records.len() as u64;
+                    let started = Instant::now();
                     match index.write(batch) {
                         Ok(next) => *state = next,
                         Err(error) => result = Err(error.into()),
                     }
+                    stats.write += started.elapsed();
                 }
             }
-            result
+            result.map(|state| (state, stats))
         });
 
         let parsers: Vec<_> = (0..config.parser_workers)
             .map(|_| {
                 let raw_rx = Arc::clone(&raw_rx);
                 let prepared_tx = prepared_tx.clone();
-                scope.spawn(move || -> Result<(), PipelineError> {
+                scope.spawn(move || -> Result<ParseStats, PipelineError> {
+                    let mut stats = ParseStats::default();
                     loop {
+                        let started = Instant::now();
                         let block = match raw_rx.lock().map_err(|_| PipelineError::Panic)?.recv() {
                             Ok(block) => block,
-                            Err(_) => return Ok(()),
+                            Err(_) => return Ok(stats),
                         };
+                        stats.receive_wait += started.elapsed();
+                        stats.blocks += 1;
+                        stats.bytes += block.bytes.len() as u64;
+                        let started = Instant::now();
                         let prepared = parse_block(&block)?;
+                        stats.parse += started.elapsed();
+                        let started = Instant::now();
                         if prepared_tx.send(prepared).is_err() {
-                            return Ok(());
+                            return Ok(stats);
                         }
+                        stats.send_wait += started.elapsed();
                     }
                 })
             })
@@ -167,47 +229,26 @@ pub(crate) fn sync_historical(
             .map(|_| {
                 let raw_tx = raw_tx.clone();
                 let next = Arc::clone(&next);
-                scope.spawn(move || -> Result<(), PipelineError> {
+                scope.spawn(move || -> Result<FetchStats, PipelineError> {
+                    let mut stats = FetchStats::default();
                     loop {
                         let segment_start = next
                             .fetch_add(u64::from(config.source_segment_blocks), Ordering::Relaxed);
                         if segment_start > u64::from(target) {
-                            return Ok(());
+                            return Ok(stats);
                         }
                         let segment_end = segment_start
                             .saturating_add(u64::from(config.source_segment_blocks - 1))
-                            .min(u64::from(target));
-                        let mut cursor = segment_start as u32;
-                        while u64::from(cursor) <= segment_end {
-                            let count = (segment_end - u64::from(cursor) + 1) as u32;
-                            let range = read_range(db, cursor, count, request_bytes)?;
-                            if range.source_tip.is_none_or(|(height, hash)| {
-                                height < tip_height || (height == tip_height && hash != tip_hash)
-                            }) {
-                                return Err(PipelineError::SourceChanged);
-                            }
-                            if cursor < range.retained_body_floor.0 {
-                                return Err(PipelineError::MissingBody { height: cursor });
-                            }
-                            if range.blocks.is_empty() {
-                                return Err(PipelineError::MissingBody { height: cursor });
-                            }
-                            for block in range.blocks {
-                                if u64::from(cursor) > segment_end || block.height.0 != cursor {
-                                    return Err(PipelineError::SourceGap {
-                                        expected: cursor,
-                                        actual: Some(block.height.0),
-                                    });
-                                }
-                                if block.height == tip_height && block.hash != tip_hash {
-                                    return Err(PipelineError::SourceChanged);
-                                }
-                                cursor = cursor.checked_add(1).ok_or(IngestError::Overflow)?;
-                                if raw_tx.send(block).is_err() {
-                                    return Ok(());
-                                }
-                            }
-                        }
+                            .min(u64::from(target))
+                            as u32;
+                        stats.add(stream_source(
+                            db,
+                            segment_start as u32,
+                            segment_end,
+                            (segment_end == target).then_some(tip_hash),
+                            config.max_source_bytes,
+                            &raw_tx,
+                        )?);
                     }
                 })
             })
@@ -215,30 +256,212 @@ pub(crate) fn sync_historical(
         drop(raw_tx);
 
         let mut builder = OrderedBuilder::new(initial_state, config.max_pending_bytes)?;
-        while let Ok(block) = prepared_rx.recv() {
+        let mut coordinator_receive_wait = Duration::ZERO;
+        let mut batch_send_wait = Duration::ZERO;
+        loop {
+            let started = Instant::now();
+            let Ok(block) = prepared_rx.recv() else {
+                break;
+            };
+            coordinator_receive_wait += started.elapsed();
             builder.push(block)?;
-            if builder.pending_bytes() >= config.max_batch_bytes
+            if builder.ready_bytes() >= config.max_batch_bytes
                 && let Some(batch) =
                     builder.build_batch(Some(target), Some(target), config.max_batch_bytes)?
             {
+                let started = Instant::now();
                 batch_tx.send(batch).map_err(|_| PipelineError::Worker)?;
+                batch_send_wait += started.elapsed();
             }
         }
         while let Some(batch) =
             builder.build_batch(Some(target), Some(target), config.max_batch_bytes)?
         {
+            let started = Instant::now();
             batch_tx.send(batch).map_err(|_| PipelineError::Worker)?;
+            batch_send_wait += started.elapsed();
         }
         drop(batch_tx);
 
+        let mut parse_stats = ParseStats::default();
         for parser in parsers {
-            parser.join().map_err(|_| PipelineError::Panic)??;
+            let stats = parser.join().map_err(|_| PipelineError::Panic)??;
+            parse_stats.receive_wait += stats.receive_wait;
+            parse_stats.parse += stats.parse;
+            parse_stats.send_wait += stats.send_wait;
+            parse_stats.blocks += stats.blocks;
+            parse_stats.bytes += stats.bytes;
         }
+        let mut fetch_stats = FetchStats::default();
         for fetcher in fetchers {
-            fetcher.join().map_err(|_| PipelineError::Panic)??;
+            let stats = fetcher.join().map_err(|_| PipelineError::Panic)??;
+            fetch_stats.read += stats.read;
+            fetch_stats.header_read += stats.header_read;
+            fetch_stats.transaction_read += stats.transaction_read;
+            fetch_stats.txid_read += stats.txid_read;
+            fetch_stats.assemble += stats.assemble;
+            fetch_stats.send_wait += stats.send_wait;
+            fetch_stats.ranges += stats.ranges;
+            fetch_stats.blocks += stats.blocks;
+            fetch_stats.bytes += stats.bytes;
         }
-        writer.join().map_err(|_| PipelineError::Panic)?
+        let (state, write_stats) = writer.join().map_err(|_| PipelineError::Panic)??;
+        info!(
+            fetch_read_seconds = fetch_stats.read.as_secs_f64(),
+            fetch_header_read_seconds = fetch_stats.header_read.as_secs_f64(),
+            fetch_transaction_read_seconds = fetch_stats.transaction_read.as_secs_f64(),
+            fetch_txid_read_seconds = fetch_stats.txid_read.as_secs_f64(),
+            fetch_assemble_seconds = fetch_stats.assemble.as_secs_f64(),
+            fetch_send_wait_seconds = fetch_stats.send_wait.as_secs_f64(),
+            fetch_ranges = fetch_stats.ranges,
+            fetch_blocks = fetch_stats.blocks,
+            fetch_bytes = fetch_stats.bytes,
+            parser_receive_wait_seconds = parse_stats.receive_wait.as_secs_f64(),
+            parse_seconds = parse_stats.parse.as_secs_f64(),
+            parser_send_wait_seconds = parse_stats.send_wait.as_secs_f64(),
+            parsed_blocks = parse_stats.blocks,
+            parsed_bytes = parse_stats.bytes,
+            coordinator_receive_wait_seconds = coordinator_receive_wait.as_secs_f64(),
+            batch_send_wait_seconds = batch_send_wait.as_secs_f64(),
+            write_seconds = write_stats.write.as_secs_f64(),
+            write_batches = write_stats.batches,
+            written_blocks = write_stats.blocks,
+            "historical pipeline stage totals"
+        );
+        Ok(state)
     })
+}
+
+fn stream_source(
+    db: &ZakuraDb,
+    start: u32,
+    target: u32,
+    target_hash: Option<block::Hash>,
+    max_block_bytes: usize,
+    raw_tx: &SyncSender<RawIndexBlock>,
+) -> Result<FetchStats, PipelineError> {
+    let mut stats = FetchStats::default();
+    let mut headers = db.block_headers_by_height_range(Height(start)..=Height(target));
+    let transaction_range = TransactionLocation::min_for_height(Height(start))
+        ..=TransactionLocation::max_for_height(Height(target));
+    let mut transactions = db
+        .raw_transactions_by_location_range(transaction_range.clone())
+        .peekable();
+    let mut transaction_hashes = db
+        .transaction_hashes_by_location_range(transaction_range)
+        .peekable();
+
+    for raw_height in start..=target {
+        let height = Height(raw_height);
+        let started = Instant::now();
+        let (actual_height, header) = headers.next().ok_or(PipelineError::SourceGap {
+            expected: raw_height,
+            actual: None,
+        })?;
+        stats.header_read += started.elapsed();
+        if actual_height != height {
+            return Err(PipelineError::SourceGap {
+                expected: raw_height,
+                actual: Some(actual_height.0),
+            });
+        }
+
+        let mut block_transactions = Vec::new();
+        let mut txids = Vec::new();
+        loop {
+            let started = Instant::now();
+            let transaction = transactions.next_if(|(location, _)| location.height == height);
+            stats.transaction_read += started.elapsed();
+            let Some((transaction_location, transaction)) = transaction else {
+                break;
+            };
+            block_transactions.push(transaction);
+
+            let started = Instant::now();
+            let Some((location, txid)) = transaction_hashes.next() else {
+                return Err(PipelineError::SourceChanged);
+            };
+            stats.txid_read += started.elapsed();
+            if location != transaction_location {
+                return Err(PipelineError::SourceChanged);
+            }
+            txids.push(txid);
+        }
+        if block_transactions.is_empty() {
+            return Err(PipelineError::MissingBody { height: raw_height });
+        }
+        if transaction_hashes
+            .peek()
+            .is_some_and(|(location, _)| location.height == height)
+        {
+            return Err(PipelineError::SourceChanged);
+        }
+
+        let started = Instant::now();
+        let hash = header.hash();
+        if height.0 == target && target_hash.is_some_and(|target_hash| hash != target_hash) {
+            return Err(PipelineError::SourceChanged);
+        }
+        let tx_count = CompactSizeMessage::try_from(block_transactions.len())
+            .expect("stored block transaction count is valid")
+            .zcash_serialize_to_vec()
+            .expect("serialization to a byte vector cannot fail");
+        let size = header
+            .zcash_serialized_size()
+            .checked_add(tx_count.len())
+            .and_then(|size| {
+                block_transactions
+                    .iter()
+                    .try_fold(size, |size, transaction| {
+                        size.checked_add(transaction.raw_bytes().len())
+                    })
+            })
+            .ok_or(PipelineError::SourceSize { height: raw_height })?;
+        let block_bytes = size
+            .checked_add(
+                txids
+                    .len()
+                    .checked_mul(32)
+                    .ok_or(PipelineError::SourceSize { height: raw_height })?,
+            )
+            .ok_or(PipelineError::SourceSize { height: raw_height })?;
+        if block_bytes > max_block_bytes {
+            return Err(PipelineError::BlockExceedsByteLimit {
+                height: raw_height,
+                required: block_bytes,
+                limit: max_block_bytes,
+            });
+        }
+        let mut bytes = Vec::with_capacity(size);
+        header
+            .zcash_serialize(&mut bytes)
+            .expect("serialization to a byte vector cannot fail");
+        bytes.extend_from_slice(&tx_count);
+        for transaction in block_transactions {
+            bytes.extend_from_slice(transaction.raw_bytes());
+        }
+        stats.assemble += started.elapsed();
+        stats.read = stats.header_read + stats.transaction_read + stats.txid_read + stats.assemble;
+        stats.ranges = 1;
+        stats.blocks += 1;
+        stats.bytes += bytes.len() as u64;
+
+        let started = Instant::now();
+        if raw_tx
+            .send(RawIndexBlock {
+                height,
+                hash,
+                bytes,
+                txids,
+            })
+            .is_err()
+        {
+            return Ok(stats);
+        }
+        stats.send_wait += started.elapsed();
+    }
+
+    Ok(stats)
 }
 
 fn read_range(
@@ -252,24 +475,66 @@ fn read_range(
     let mut blocks = Vec::new();
     let mut response_bytes = 0usize;
 
-    for offset in 0..count {
-        let Some(height) = start.checked_add(offset).map(Height) else {
-            break;
-        };
-        if source_tip.is_none_or(|(tip, _)| height > tip) {
-            break;
+    let Some(end) = count
+        .checked_sub(1)
+        .and_then(|offset| start.checked_add(offset))
+        .zip(source_tip)
+        .map(|(end, (tip, _))| end.min(tip.0))
+        .filter(|end| start <= *end)
+    else {
+        return Ok(SourceRange {
+            blocks,
+            retained_body_floor,
+            source_tip,
+        });
+    };
+
+    let headers = (start..=end)
+        .map(|raw_height| {
+            let height = Height(raw_height);
+            db.block_header(height.into())
+                .map(|header| (height, header))
+                .ok_or(PipelineError::SourceGap {
+                    expected: raw_height,
+                    actual: None,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut transactions = db
+        .transactions_by_location_range(
+            TransactionLocation::min_for_height(Height(start))
+                ..=TransactionLocation::max_for_height(Height(end)),
+        )
+        .peekable();
+
+    for (height, header) in headers {
+        let mut block_transactions = Vec::new();
+        while transactions
+            .peek()
+            .is_some_and(|(location, _)| location.height == height)
+        {
+            let (_, transaction) = transactions
+                .next()
+                .expect("the transaction was just checked");
+            block_transactions.push(Arc::new(transaction));
         }
-        let hash = db.hash(height).ok_or(PipelineError::SourceGap {
-            expected: height.0,
-            actual: None,
-        })?;
-        let bytes = db
-            .raw_block_bytes(height.into())
-            .ok_or(PipelineError::MissingBody { height: height.0 })?;
-        let txids = db
-            .transaction_hashes_for_block(height.into())
-            .ok_or(PipelineError::MissingBody { height: height.0 })?
-            .to_vec();
+        if block_transactions.is_empty() {
+            return Err(PipelineError::MissingBody { height: height.0 });
+        }
+
+        let block = block::Block {
+            header,
+            transactions: block_transactions,
+        };
+        let hash = block.hash();
+        let txids = block
+            .transactions
+            .iter()
+            .map(|transaction| transaction.hash())
+            .collect::<Vec<_>>();
+        let bytes = block
+            .zcash_serialize_to_vec()
+            .expect("serialization to a byte vector cannot fail");
         let block_bytes = bytes
             .len()
             .checked_add(
