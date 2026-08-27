@@ -14,9 +14,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tonic = "0.14.6"
 tracing = "0.1"
-zakura-chain = { path = "../../../zakura/crates/zakura-chain" }
-zakura-state = { path = "../../../zakura/crates/zakura-state", features = ["indexer"] }
-zakurad = { package = "zakura", path = "../../../zakura/crates/zakurad", default-features = false }
+zakura-chain = { git = "https://github.com/distractedm1nd/zakura.git", branch = "indexing" }
+zakura-state = { git = "https://github.com/distractedm1nd/zakura.git", branch = "indexing", features = ["indexer"] }
+zakurad = { package = "zakura", git = "https://github.com/distractedm1nd/zakura.git", branch = "indexing", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
