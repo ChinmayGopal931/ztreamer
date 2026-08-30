@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -8,8 +9,15 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::Status;
 use tower::ServiceExt;
-use zakura_chain::{block, serialization::ZcashSerialize, subtree::NoteCommitmentSubtreeIndex};
+use zakura_chain::{
+    block,
+    serialization::{ZcashDeserialize, ZcashSerialize},
+    subtree::NoteCommitmentSubtreeIndex,
+    transaction::{self, Transaction},
+    transparent,
+};
 use zakura_state::{ReadRequest, ReadResponse, ReadStateService};
+use zakurad::node::NodeClient;
 
 use crate::serve::{PoolSelection, compact_block, compact_block_nullifiers};
 use ztreamer_indexer::{
@@ -22,6 +30,7 @@ use ztreamer_protocol::proto;
 
 pub(crate) type RpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 const MAX_RANGE_READERS: usize = 16;
+const MAX_UTXO_ADDRESSES: usize = 1_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServingSnapshot {
@@ -134,6 +143,7 @@ pub struct CompactService {
     snapshot: watch::Sender<ServingSnapshot>,
     chain_name: Arc<str>,
     zakura: ReadStateService,
+    node: Option<NodeClient>,
     range_readers: Arc<Semaphore>,
 }
 
@@ -144,14 +154,27 @@ impl CompactService {
         chain_name: impl Into<Arc<str>>,
         zakura: ReadStateService,
     ) -> Self {
+        let chain_name = chain_name.into();
         let (snapshot, _) = watch::channel(state.into());
         Self {
             index,
             snapshot,
-            chain_name: chain_name.into(),
+            chain_name,
             zakura,
+            node: None,
             range_readers: Arc::new(Semaphore::new(MAX_RANGE_READERS)),
         }
+    }
+
+    pub fn with_node(
+        index: Arc<Index>,
+        state: IndexState,
+        chain_name: impl Into<Arc<str>>,
+        node: NodeClient,
+    ) -> Self {
+        let mut service = Self::new(index, state, chain_name, node.read_state());
+        service.node = Some(node);
+        service
     }
 
     pub fn publish(&self, state: IndexState) {
@@ -537,7 +560,7 @@ impl CompactService {
         proto::LightdInfo {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             vendor: "Ztreamer".to_owned(),
-            taddr_support: false,
+            taddr_support: true,
             chain_name: self.chain_name.to_string(),
             block_height: tip.map_or(0, |tip| u64::from(tip.height)),
             estimated_height: tip.map_or(0, |tip| u64::from(tip.height)),
@@ -558,28 +581,32 @@ impl CompactService {
             .hash
             .try_into()
             .map_err(|_| Status::invalid_argument("transaction hash must be 32 bytes"))?;
+        self.mined_transaction(transaction::Hash(hash))
+            .await?
+            .ok_or_else(|| Status::not_found("transaction not found"))
+    }
+
+    async fn mined_transaction(
+        &self,
+        hash: transaction::Hash,
+    ) -> Result<Option<proto::RawTransaction>, Status> {
         let response = self
             .zakura
             .clone()
-            .oneshot(ReadRequest::Transaction(zakura_chain::transaction::Hash(
-                hash,
-            )))
+            .oneshot(ReadRequest::Transaction(hash))
             .await
             .map_err(source_status)?;
-        let transaction = match response {
-            ReadResponse::Transaction(Some(transaction)) => transaction,
-            ReadResponse::Transaction(None) => {
-                return Err(Status::not_found("transaction not found"));
-            }
-            _ => return Err(Status::internal("unexpected transaction response")),
-        };
-        Ok(proto::RawTransaction {
-            data: transaction
-                .tx
-                .zcash_serialize_to_vec()
-                .map_err(|error| Status::internal(error.to_string()))?,
-            height: u64::from(transaction.height.0),
-        })
+        match response {
+            ReadResponse::Transaction(Some(transaction)) => Ok(Some(proto::RawTransaction {
+                data: transaction
+                    .tx
+                    .zcash_serialize_to_vec()
+                    .map_err(|error| Status::internal(error.to_string()))?,
+                height: u64::from(transaction.height.0),
+            })),
+            ReadResponse::Transaction(None) => Ok(None),
+            _ => Err(Status::internal("unexpected transaction response")),
+        }
     }
 
     pub(crate) async fn latest_tree_state(&self) -> Result<proto::TreeState, Status> {
@@ -647,6 +674,196 @@ impl CompactService {
             _ => return Err(Status::internal("unexpected subtree response")),
         };
         Ok(self.subtree_stream(roots, self.snapshot().generation))
+    }
+
+    pub(crate) async fn send_transaction(
+        &self,
+        request: proto::RawTransaction,
+    ) -> Result<proto::SendResponse, Status> {
+        let transaction = Transaction::zcash_deserialize(request.data.as_slice())
+            .map_err(|error| Status::invalid_argument(format!("invalid transaction: {error}")))?;
+        let node = self.node()?.clone();
+        let runtime = tokio::runtime::Handle::current();
+        // zakura's submit_transaction future is not Send
+        let txid = tokio::task::spawn_blocking(move || {
+            runtime
+                .block_on(node.submit_transaction(transaction))
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| Status::unavailable(format!("Zakura task failed: {error}")))?
+        .map_err(|error| Status::invalid_argument(format!("Zakura rejected transaction: {error}")))?
+        .mined_id();
+        Ok(proto::SendResponse {
+            error_code: 0,
+            error_message: txid.to_string(),
+        })
+    }
+
+    pub(crate) async fn taddress_transactions(
+        &self,
+        request: proto::TransparentAddressBlockFilter,
+    ) -> Result<RpcStream<proto::RawTransaction>, Status> {
+        let address = self.parse_address(&request.address)?;
+        let range = request
+            .range
+            .ok_or_else(|| Status::invalid_argument("block range is required"))?;
+        let tip = self.zakura_tip().await?;
+        let endpoint = |endpoint: Option<proto::BlockId>| -> Result<Option<u32>, Status> {
+            endpoint
+                .map(|block| {
+                    u32::try_from(block.height)
+                        .map(|height| height.min(tip))
+                        .map_err(|_| Status::invalid_argument("block height exceeds u32"))
+                })
+                .transpose()
+        };
+        let mut start = endpoint(range.start)?.unwrap_or(0);
+        let mut end = endpoint(range.end)?.unwrap_or(tip);
+        if end == 0 {
+            end = tip;
+        }
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        let response = self
+            .zakura
+            .clone()
+            .oneshot(ReadRequest::TransactionIdsByAddresses {
+                addresses: HashSet::from([address]),
+                height_range: block::Height(start)..=block::Height(end),
+            })
+            .await
+            .map_err(source_status)?;
+        let ReadResponse::AddressesTransactionIds(transactions) = response else {
+            return Err(Status::internal("unexpected address transaction response"));
+        };
+
+        let service = self.clone();
+        let (sender, receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            for hash in transactions.into_values() {
+                match service.mined_transaction(hash).await {
+                    Ok(Some(transaction)) => {
+                        if sender.send(Ok(transaction)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = sender
+                            .send(Err(Status::unavailable(
+                                "Zakura address index referenced a missing transaction",
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(receiver)))
+    }
+
+    pub(crate) async fn taddress_balance(
+        &self,
+        addresses: Vec<String>,
+    ) -> Result<proto::Balance, Status> {
+        let addresses = self.parse_addresses(addresses)?;
+        let response = self
+            .zakura
+            .clone()
+            .oneshot(ReadRequest::AddressBalance(addresses))
+            .await
+            .map_err(source_status)?;
+        let ReadResponse::AddressBalance { balance, .. } = response else {
+            return Err(Status::internal("unexpected address balance response"));
+        };
+        Ok(proto::Balance {
+            value_zat: i64::try_from(u64::from(balance))
+                .map_err(|_| Status::out_of_range("transparent balance exceeds i64"))?,
+        })
+    }
+
+    pub(crate) async fn address_utxos(
+        &self,
+        request: proto::GetAddressUtxosArg,
+    ) -> Result<Vec<proto::GetAddressUtxosReply>, Status> {
+        if request.addresses.len() > MAX_UTXO_ADDRESSES {
+            return Err(Status::invalid_argument(format!(
+                "too many addresses: {} exceeds {MAX_UTXO_ADDRESSES}",
+                request.addresses.len()
+            )));
+        }
+        let addresses = self.parse_addresses(request.addresses)?;
+        let response = self
+            .zakura
+            .clone()
+            .oneshot(ReadRequest::UtxosByAddresses(addresses))
+            .await
+            .map_err(source_status)?;
+        let ReadResponse::AddressUtxos(utxos) = response else {
+            return Err(Status::internal("unexpected address UTXO response"));
+        };
+        let limit = usize::try_from(request.max_entries).unwrap_or(usize::MAX);
+        utxos
+            .utxos()
+            .filter(|(_, _, location, _)| u64::from(location.height().0) >= request.start_height)
+            .take(if limit == 0 { usize::MAX } else { limit })
+            .map(|(address, txid, location, output)| {
+                Ok(proto::GetAddressUtxosReply {
+                    address: address.to_string(),
+                    txid: txid.0.to_vec(),
+                    index: i32::try_from(location.output_index().index()).map_err(|_| {
+                        Status::out_of_range("transparent output index exceeds i32")
+                    })?,
+                    script: output.lock_script.as_raw_bytes().to_vec(),
+                    value_zat: i64::try_from(u64::from(output.value)).map_err(|_| {
+                        Status::out_of_range("transparent output value exceeds i64")
+                    })?,
+                    height: u64::from(location.height().0),
+                })
+            })
+            .collect()
+    }
+
+    fn parse_addresses(
+        &self,
+        addresses: impl IntoIterator<Item = String>,
+    ) -> Result<HashSet<transparent::Address>, Status> {
+        addresses
+            .into_iter()
+            .map(|address| self.parse_address(&address))
+            .collect()
+    }
+
+    fn parse_address(&self, address: &str) -> Result<transparent::Address, Status> {
+        let address: transparent::Address = address
+            .parse()
+            .map_err(|error| Status::invalid_argument(format!("invalid address: {error}")))?;
+        Ok(address)
+    }
+
+    async fn zakura_tip(&self) -> Result<u32, Status> {
+        let response = self
+            .zakura
+            .clone()
+            .oneshot(ReadRequest::Tip)
+            .await
+            .map_err(source_status)?;
+        match response {
+            ReadResponse::Tip(Some((height, _))) => Ok(height.0),
+            ReadResponse::Tip(None) => Err(Status::unavailable("Zakura chain is empty")),
+            _ => Err(Status::internal("unexpected tip response")),
+        }
+    }
+
+    fn node(&self) -> Result<&NodeClient, Status> {
+        self.node
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("embedded Zakura node handle is unavailable"))
     }
 
     pub(crate) fn unsupported(method: &'static str) -> Status {
@@ -944,10 +1161,31 @@ mod tests {
                     tonic::Code::InvalidArgument
                 );
                 assert_eq!(
-                    service
-                        .send_transaction(Request::new(proto::RawTransaction::default()))
+                    CompactTxStreamer::send_transaction(
+                        &service,
+                        Request::new(proto::RawTransaction::default()),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                    tonic::Code::InvalidArgument
+                );
+                assert_eq!(
+                    CompactTxStreamer::get_mempool_tx(
+                        &service,
+                        Request::new(proto::GetMempoolTxRequest::default()),
+                    )
+                    .await
+                    .err()
+                    .unwrap()
+                    .code(),
+                    tonic::Code::Unimplemented
+                );
+                assert_eq!(
+                    CompactTxStreamer::get_mempool_stream(&service, Request::new(proto::Empty {}),)
                         .await
-                        .unwrap_err()
+                        .err()
+                        .unwrap()
                         .code(),
                     tonic::Code::Unimplemented
                 );

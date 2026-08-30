@@ -175,12 +175,8 @@ async fn main() -> Result<()> {
             .map_err(|error| anyhow!("shut down embedded Zakura: {error}"));
     }
 
-    let compact = CompactService::new(
-        index,
-        state,
-        network.bip70_network_name(),
-        client.read_state(),
-    );
+    let compact =
+        CompactService::with_node(index, state, network.bip70_network_name(), client.clone());
     p2p.install(compact.clone())
         .map_err(|error| anyhow!(error))?;
     drop(p2p);

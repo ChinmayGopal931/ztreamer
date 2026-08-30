@@ -1,5 +1,6 @@
 //! gRPC adapter for [`crate::CompactService`].
 
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 use ztreamer_protocol::proto::{self, compact_tx_streamer_server::CompactTxStreamer};
 
@@ -101,37 +102,57 @@ impl CompactTxStreamer for CompactService {
 
     async fn send_transaction(
         &self,
-        _request: Request<proto::RawTransaction>,
+        request: Request<proto::RawTransaction>,
     ) -> Result<Response<proto::SendResponse>, Status> {
-        Err(Self::unsupported("SendTransaction"))
+        Ok(Response::new(
+            self.send_transaction(request.into_inner()).await?,
+        ))
     }
 
     async fn get_taddress_txids(
         &self,
-        _request: Request<proto::TransparentAddressBlockFilter>,
+        request: Request<proto::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTxidsStream>, Status> {
-        Err(Self::unsupported("GetTaddressTxids"))
+        Ok(Response::new(
+            self.taddress_transactions(request.into_inner()).await?,
+        ))
     }
 
     async fn get_taddress_transactions(
         &self,
-        _request: Request<proto::TransparentAddressBlockFilter>,
+        request: Request<proto::TransparentAddressBlockFilter>,
     ) -> Result<Response<Self::GetTaddressTransactionsStream>, Status> {
-        Err(Self::unsupported("GetTaddressTransactions"))
+        Ok(Response::new(
+            self.taddress_transactions(request.into_inner()).await?,
+        ))
     }
 
     async fn get_taddress_balance(
         &self,
-        _request: Request<proto::AddressList>,
+        request: Request<proto::AddressList>,
     ) -> Result<Response<proto::Balance>, Status> {
-        Err(Self::unsupported("GetTaddressBalance"))
+        Ok(Response::new(
+            self.taddress_balance(request.into_inner().addresses)
+                .await?,
+        ))
     }
 
     async fn get_taddress_balance_stream(
         &self,
-        _request: Request<tonic::Streaming<proto::Address>>,
+        request: Request<tonic::Streaming<proto::Address>>,
     ) -> Result<Response<proto::Balance>, Status> {
-        Err(Self::unsupported("GetTaddressBalanceStream"))
+        let mut request = request.into_inner();
+        let mut value_zat = 0i64;
+        while let Some(address) = request.next().await {
+            let balance = self
+                .taddress_balance(vec![address?.address])
+                .await?
+                .value_zat;
+            value_zat = value_zat
+                .checked_add(balance)
+                .ok_or_else(|| Status::out_of_range("transparent balance exceeds i64"))?;
+        }
+        Ok(Response::new(proto::Balance { value_zat }))
     }
 
     async fn get_mempool_tx(
@@ -150,15 +171,20 @@ impl CompactTxStreamer for CompactService {
 
     async fn get_address_utxos(
         &self,
-        _request: Request<proto::GetAddressUtxosArg>,
+        request: Request<proto::GetAddressUtxosArg>,
     ) -> Result<Response<proto::GetAddressUtxosReplyList>, Status> {
-        Err(Self::unsupported("GetAddressUtxos"))
+        Ok(Response::new(proto::GetAddressUtxosReplyList {
+            address_utxos: self.address_utxos(request.into_inner()).await?,
+        }))
     }
 
     async fn get_address_utxos_stream(
         &self,
-        _request: Request<proto::GetAddressUtxosArg>,
+        request: Request<proto::GetAddressUtxosArg>,
     ) -> Result<Response<Self::GetAddressUtxosStreamStream>, Status> {
-        Err(Self::unsupported("GetAddressUtxosStream"))
+        let utxos = self.address_utxos(request.into_inner()).await?;
+        Ok(Response::new(Box::pin(tokio_stream::iter(
+            utxos.into_iter().map(Ok),
+        ))))
     }
 }

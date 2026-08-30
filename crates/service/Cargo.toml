@@ -11,9 +11,10 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = "0.14.6"
 tower = { version = "0.4.13", features = ["util"] }
-zakura-chain = { git = "https://github.com/distractedm1nd/zakura.git", branch = "indexing" }
-zakura-network = { git = "https://github.com/distractedm1nd/zakura.git", branch = "indexing" }
-zakura-state = { git = "https://github.com/distractedm1nd/zakura.git", branch = "indexing", features = ["indexer"] }
+zakura-chain = { path = "../../../zakura/crates/zakura-chain" }
+zakura-network = { path = "../../../zakura/crates/zakura-network" }
+zakura-state = { path = "../../../zakura/crates/zakura-state", features = ["indexer"] }
+zakurad = { package = "zakura", path = "../../../zakura/crates/zakurad", default-features = false }
 ztreamer-indexer = { path = "../indexer" }
 ztreamer-protocol = { path = "../protocol" }
 
