@@ -13,8 +13,13 @@ The point of this project is for me to make a `CompactTxStreamer` server over v2
 - saves blocks in ranges of 1000, seals after 100, persists to LMDB after 10. Still handles deep reorgs just fine. Zaino only adds to db after 1000 confirmations, keeping these recent blocks in passthrough mode (on demand CompactBlocks, orders of magnitude slower).
 - adds concurrency to initial indexing
 - offers the supported CompactTxStreamer methods as a Zakura custom p2p service
-- delegates transparent-address, UTXO, and transaction-submission gRPC methods
-  directly to embedded Zakura services; mempool RPCs remain unsupported
+- delegates transparent-address, UTXO, transaction-submission, and mempool-stream gRPC methods
+  directly to embedded Zakura services; `GetMempoolTx` remains unsupported
+
+## caveats
+- `GetBlock` excludes transparent data, as no wallets try to access it and dont have a reason to.
+- `GetBlockRange` rejects transparent filters. We believe transparent range scanning is not worth the bandwidth tradeoff, which we see in wallet adoption -- if wallets end up using requests this way one day, we will add it.
+- `GetLightdInfo` is not fully populated yet.
 
 ## benchmarks
 

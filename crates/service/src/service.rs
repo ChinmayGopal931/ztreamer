@@ -584,8 +584,24 @@ impl CompactService {
             .hash
             .try_into()
             .map_err(|_| Status::invalid_argument("transaction hash must be 32 bytes"))?;
-        self.mined_transaction(transaction::Hash(hash))
+        let hash = transaction::Hash(hash);
+        if let Some(transaction) = self.mined_transaction(hash).await? {
+            return Ok(transaction);
+        }
+
+        // todo(@distractedm1nd): this sucks and should be replaced with a direct mempool query
+        Self::mempool_transactions(self.node()?.clone())
             .await?
+            .into_iter()
+            .find(|transaction| transaction.id().mined_id() == hash)
+            .map(|transaction| {
+                transaction
+                    .transaction()
+                    .zcash_serialize_to_vec()
+                    .map(|data| proto::RawTransaction { data, height: 0 })
+                    .map_err(|error| Status::internal(error.to_string()))
+            })
+            .transpose()?
             .ok_or_else(|| Status::not_found("transaction not found"))
     }
 
@@ -701,6 +717,82 @@ impl CompactService {
             error_code: 0,
             error_message: txid.to_string(),
         })
+    }
+
+    pub(crate) async fn mempool_stream(&self) -> Result<RpcStream<proto::RawTransaction>, Status> {
+        let node = self.node()?.clone();
+        let mut tip_changes = node.subscribe_chain_tip();
+        let _ = tip_changes.last_tip_change();
+        let mut transactions = Self::mempool_transactions(node.clone()).await?;
+        let (sender, receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let mut seen = HashSet::new();
+            loop {
+                for transaction in transactions.drain(..) {
+                    if !seen.insert(transaction.id()) {
+                        continue;
+                    }
+                    let transaction = match transaction.transaction().zcash_serialize_to_vec() {
+                        Ok(data) => proto::RawTransaction { data, height: 0 },
+                        Err(error) => {
+                            let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        change = tip_changes.wait_for_tip_change() => {
+                            if let Err(error) = change {
+                                let _ = sender.send(Err(Status::unavailable(format!(
+                                    "Zakura chain-tip listener failed: {error}"
+                                )))).await;
+                            }
+                            return;
+                        }
+                        result = sender.send(Ok(transaction)) => {
+                            if result.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                transactions = tokio::select! {
+                    biased;
+                    change = tip_changes.wait_for_tip_change() => {
+                        if let Err(error) = change {
+                            let _ = sender.send(Err(Status::unavailable(format!(
+                                "Zakura chain-tip listener failed: {error}"
+                            )))).await;
+                        }
+                        return;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        match Self::mempool_transactions(node.clone()).await {
+                            Ok(transactions) => transactions,
+                            Err(error) => {
+                                let _ = sender.send(Err(error)).await;
+                                return;
+                            }
+                        }
+                    }
+                };
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(receiver)))
+    }
+
+    async fn mempool_transactions(node: NodeClient) -> Result<Vec<transaction::UnminedTx>, Status> {
+        let runtime = tokio::runtime::Handle::current();
+        // Zakura's mempool service future is not Send.
+        tokio::task::spawn_blocking(move || {
+            runtime
+                .block_on(node.mempool_transactions())
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| Status::unavailable(format!("Zakura task failed: {error}")))?
+        .map_err(|error| Status::unavailable(format!("Zakura mempool query failed: {error}")))
     }
 
     pub(crate) async fn taddress_transactions(
@@ -1151,6 +1243,17 @@ mod tests {
                         .await
                         .is_ok()
                 );
+                assert_eq!(
+                    service
+                        .get_transaction(Request::new(proto::TxFilter {
+                            hash: vec![0; 32],
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    tonic::Code::Unavailable
+                );
 
                 let mut transparent = range;
                 transparent.pool_types = vec![proto::PoolType::Transparent as i32];
@@ -1190,7 +1293,7 @@ mod tests {
                         .err()
                         .unwrap()
                         .code(),
-                    tonic::Code::Unimplemented
+                    tonic::Code::Unavailable
                 );
             });
     }

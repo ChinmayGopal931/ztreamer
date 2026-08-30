@@ -11,10 +11,10 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = "0.14.6"
 tower = { version = "0.4.13", features = ["util"] }
-zakura-chain = { path = "../../../zakura/crates/zakura-chain" }
-zakura-network = { path = "../../../zakura/crates/zakura-network" }
-zakura-state = { path = "../../../zakura/crates/zakura-state", features = ["indexer"] }
-zakurad = { package = "zakura", path = "../../../zakura/crates/zakurad", default-features = false }
+zakura-chain.workspace = true
+zakura-network.workspace = true
+zakura-state = { workspace = true, features = ["indexer"] }
+zakurad.workspace = true
 ztreamer-indexer = { path = "../indexer" }
 ztreamer-protocol = { path = "../protocol" }
 

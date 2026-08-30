@@ -166,7 +166,7 @@ impl CompactTxStreamer for CompactService {
         &self,
         _request: Request<proto::Empty>,
     ) -> Result<Response<Self::GetMempoolStreamStream>, Status> {
-        Err(Self::unsupported("GetMempoolStream"))
+        Ok(Response::new(self.mempool_stream().await?))
     }
 
     async fn get_address_utxos(

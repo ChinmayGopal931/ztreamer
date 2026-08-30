@@ -6759,6 +6759,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 [[package]]
 name = "zakura"
 version = "1.3.0-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "abscissa_core",
  "bytes",
@@ -6852,6 +6853,7 @@ dependencies = [
 [[package]]
 name = "zakura-chain"
 version = "6.0.0-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "bech32",
  "bitflags 2.13.1",
@@ -6911,6 +6913,7 @@ dependencies = [
 [[package]]
 name = "zakura-consensus"
 version = "7.0.0-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -7007,6 +7010,7 @@ dependencies = [
 [[package]]
 name = "zakura-header-chain"
 version = "1.0.0-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "chrono",
  "rayon",
@@ -7018,6 +7022,7 @@ dependencies = [
 [[package]]
 name = "zakura-jsonl-trace"
 version = "1.2.0-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "serde",
  "serde_json",
@@ -7071,6 +7076,7 @@ dependencies = [
 [[package]]
 name = "zakura-network"
 version = "7.0.0-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "bitflags 2.13.1",
  "blake2b_simd",
@@ -7109,6 +7115,7 @@ dependencies = [
 [[package]]
 name = "zakura-node-services"
 version = "3.2.1-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "jsonrpsee-types",
  "reqwest",
@@ -7272,6 +7279,7 @@ dependencies = [
 [[package]]
 name = "zakura-rpc"
 version = "8.0.0-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "base64",
  "chrono",
@@ -7366,6 +7374,7 @@ dependencies = [
 [[package]]
 name = "zakura-script"
 version = "3.2.1-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "libzcash_script",
  "rand 0.8.8",
@@ -7390,6 +7399,7 @@ dependencies = [
 [[package]]
 name = "zakura-state"
 version = "7.0.0-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "bincode",
  "chrono",
@@ -7426,6 +7436,7 @@ dependencies = [
 [[package]]
 name = "zakura-tower-batch-control"
 version = "1.3.0-rc0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "futures",
  "futures-core",
@@ -7441,6 +7452,7 @@ dependencies = [
 [[package]]
 name = "zakura-tower-fallback"
 version = "1.2.0"
+source = "git+https://github.com/distractedm1nd/zakura.git?branch=indexing#6b7e2cd995de5920a74919956d6eaa94aa47b168"
 dependencies = [
  "futures-core",
  "pin-project",
