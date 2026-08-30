@@ -13,7 +13,9 @@ use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use zakurad::{components::metrics::MetricsEndpoint, config::ZakuradConfig, node};
-use ztreamer_indexer::{index::Index, pipeline::PipelineConfig, source::ZakuraSource};
+use ztreamer_indexer::{
+    head::HeadSyncError, index::Index, pipeline::PipelineConfig, source::ZakuraSource,
+};
 use ztreamer_protocol::proto::compact_tx_streamer_server::CompactTxStreamerServer;
 use ztreamer_service::{CompactService, HeadFollowerConfig, p2p::P2pCompactService};
 
@@ -123,8 +125,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    let source = ZakuraSource::new(client.database());
-    let sync_index = Arc::clone(&index);
     let mut pipeline = PipelineConfig::default();
     if let Some(fetch_workers) = cli.fetch_workers {
         pipeline.fetch_workers = fetch_workers.get();
@@ -138,6 +138,8 @@ async fn main() -> Result<()> {
     if let Some(max_batch_bytes) = cli.max_batch_bytes {
         pipeline.max_batch_bytes = max_batch_bytes.get();
     }
+    let source = ZakuraSource::new(client.database());
+    let sync_index = Arc::clone(&index);
     info!("syncing historical compact index");
     let historical_started = Instant::now();
     let mut historical = tokio::task::spawn_blocking(move || source.sync(&sync_index, pipeline));
@@ -177,6 +179,16 @@ async fn main() -> Result<()> {
 
     let compact =
         CompactService::with_node(index, state, network.bip70_network_name(), client.clone());
+    let mut startup_client = client.clone();
+    match compact.sync_head(&mut startup_client, pipeline).await {
+        Err(HeadSyncError::DeepReorg { .. }) => {
+            compact
+                .recover_deep_reorg(&mut startup_client, pipeline)
+                .await
+        }
+        result => result,
+    }
+    .context("reconcile compact index with Zakura's canonical head")?;
     p2p.install(compact.clone())
         .map_err(|error| anyhow!(error))?;
     drop(p2p);

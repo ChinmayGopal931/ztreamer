@@ -48,9 +48,13 @@ pub enum HeadSyncError {
     DeepReorg { height: u32 },
 }
 
-/// The one canonical-head operation Ztreamer needs from Zakura.
+/// The canonical-head operations Ztreamer needs from Zakura.
 #[tonic::async_trait]
 pub trait CanonicalBlockSource: Send {
+    async fn tip(&mut self) -> Result<Option<crate::index::BlockId>, HeadError> {
+        Ok(None)
+    }
+
     async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError>;
 }
 
@@ -77,6 +81,13 @@ fn raw_block(block: &Block) -> Result<RawIndexBlock, HeadError> {
 
 #[tonic::async_trait]
 impl CanonicalBlockSource for NodeClient {
+    async fn tip(&mut self) -> Result<Option<crate::index::BlockId>, HeadError> {
+        Ok(
+            NodeClient::tip(self)
+                .map(|(height, hash)| crate::index::BlockId::new(height.0, hash.0)),
+        )
+    }
+
     async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError> {
         let block = NodeClient::block(self, block::Height(height)).await;
         match block {
@@ -157,13 +168,30 @@ pub async fn sync_head_once(
 ) -> Result<(IndexState, Vec<CompactBlockRecord>), HeadSyncError> {
     let mut state = index.state()?;
     if current_head.is_empty() {
-        return sync_extension_once(index, source, state, config).await;
+        return match sync_extension_once(index, source, state, config).await {
+            Err(HeadSyncError::Head(HeadError::Anchor { height })) => {
+                Err(HeadSyncError::DeepReorg { height })
+            }
+            result => result,
+        };
     }
 
     let old_visible_tip = current_head
         .last()
         .map(|block| block.height)
         .expect("the current head is non-empty");
+    let old_visible_tip_hash = current_head
+        .last()
+        .map(|block| block.hash)
+        .expect("the current head is non-empty");
+    if source.tip().await?
+        == Some(crate::index::BlockId::new(
+            old_visible_tip,
+            old_visible_tip_hash,
+        ))
+    {
+        return Ok((state, current_head.to_vec()));
+    }
     let anchor_height = old_visible_tip.checked_sub(SEAL_DEPTH);
     let anchor_record = anchor_height
         .map(|height| current_record(index, state, current_head, height))
@@ -385,10 +413,30 @@ mod tests {
 
     struct Source(Vec<RawIndexBlock>);
 
+    struct TipOnly(crate::index::BlockId);
+
     #[tonic::async_trait]
     impl CanonicalBlockSource for Source {
+        async fn tip(&mut self) -> Result<Option<crate::index::BlockId>, HeadError> {
+            Ok(self
+                .0
+                .last()
+                .map(|block| crate::index::BlockId::new(block.height.0, block.hash.0)))
+        }
+
         async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError> {
             Ok(self.0.get(height as usize).cloned())
+        }
+    }
+
+    #[tonic::async_trait]
+    impl CanonicalBlockSource for TipOnly {
+        async fn tip(&mut self) -> Result<Option<crate::index::BlockId>, HeadError> {
+            Ok(Some(self.0))
+        }
+
+        async fn block(&mut self, _height: u32) -> Result<Option<RawIndexBlock>, HeadError> {
+            panic!("unchanged tips must not trigger block reads")
         }
     }
 
@@ -435,6 +483,31 @@ mod tests {
                         .collect::<Vec<_>>(),
                     (3..=12).collect::<Vec<_>>()
                 );
+            });
+    }
+
+    #[test]
+    fn unchanged_tip_skips_suffix_reads() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap();
+                let mut source = Source((0..=20).map(raw_block).collect());
+                let (state, head) =
+                    sync_head_once(&index, &mut source, &[], PipelineConfig::default())
+                        .await
+                        .unwrap();
+                let mut source = TipOnly(crate::index::BlockId::new(20, hash(20)));
+
+                let (next_state, next_head) =
+                    sync_head_once(&index, &mut source, &head, PipelineConfig::default())
+                        .await
+                        .unwrap();
+
+                assert_eq!(next_state, state);
+                assert_eq!(next_head, head);
             });
     }
 
@@ -505,6 +578,42 @@ mod tests {
                 assert_eq!(head.first().unwrap().height, 112);
                 assert_eq!(head.last().unwrap().height, 121);
                 index.verify_continuity().unwrap();
+            });
+    }
+
+    #[test]
+    fn restart_recovers_a_persisted_noncanonical_suffix() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let index = Index::open(dir.path(), 20 * 1024 * 1024, "Mainnet", [9; 32]).unwrap();
+                let mut source = Source((0..=120).map(raw_block).collect());
+                sync_head_once(&index, &mut source, &[], PipelineConfig::default())
+                    .await
+                    .unwrap();
+
+                let mut source = Source(
+                    (0..=121)
+                        .map(|height| raw_branch_block(height, 100))
+                        .collect(),
+                );
+                assert!(matches!(
+                    sync_head_once(&index, &mut source, &[], PipelineConfig::default()).await,
+                    Err(HeadSyncError::DeepReorg { height: 110 })
+                ));
+
+                let (state, head) =
+                    recover_deep_reorg(&index, &mut source, &[], PipelineConfig::default())
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    index.read_block(state.generation(), 100).unwrap().hash,
+                    branch_hash(100)
+                );
+                assert_eq!(head.first().unwrap().height, 112);
+                assert_eq!(head.last().unwrap().height, 121);
             });
     }
 

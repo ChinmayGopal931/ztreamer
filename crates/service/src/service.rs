@@ -515,18 +515,21 @@ impl CompactService {
     fn subtree_stream(
         &self,
         roots: Vec<(Vec<u8>, u32)>,
-        generation: u64,
+        snapshot: ServingSnapshot,
     ) -> RpcStream<proto::SubtreeRoot> {
         let index = Arc::clone(&self.index);
         let (sender, receiver) = mpsc::channel(1);
         tokio::task::spawn_blocking(move || {
             for (root_hash, height) in roots {
-                let block = match index.read_block(generation, height) {
-                    Ok(block) => block,
-                    Err(error) => {
-                        let _ = sender.blocking_send(Err(index_status(error)));
-                        return;
-                    }
+                let block = match snapshot.volatile(height) {
+                    Some(block) => block.clone(),
+                    None => match index.read_block(snapshot.generation, height) {
+                        Ok(block) => block,
+                        Err(error) => {
+                            let _ = sender.blocking_send(Err(index_status(error)));
+                            return;
+                        }
+                    },
                 };
                 if sender
                     .blocking_send(Ok(proto::SubtreeRoot {
@@ -673,7 +676,7 @@ impl CompactService {
                 .collect(),
             _ => return Err(Status::internal("unexpected subtree response")),
         };
-        Ok(self.subtree_stream(roots, self.snapshot().generation))
+        Ok(self.subtree_stream(roots, self.snapshot()))
     }
 
     pub(crate) async fn send_transaction(
@@ -1189,6 +1192,39 @@ mod tests {
                         .code(),
                     tonic::Code::Unimplemented
                 );
+            });
+    }
+
+    #[test]
+    fn subtree_stream_resolves_volatile_completion_blocks() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let index = Arc::new(
+                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap(),
+                );
+                let state = index_through(&index, 1_005);
+                let (_state_service, read_service, _tip, _change) = zakura_state::init(
+                    Config::ephemeral(),
+                    &Network::Mainnet,
+                    block::Height::MAX,
+                    0,
+                )
+                .await;
+                let service = CompactService::new(index, state, "main", read_service);
+                service
+                    .publish_head(state, vec![record(1_006), record(1_007)])
+                    .unwrap();
+
+                let mut stream =
+                    service.subtree_stream(vec![(vec![7; 32], 1_007)], service.snapshot());
+                let root = stream.next().await.unwrap().unwrap();
+
+                assert_eq!(root.root_hash, vec![7; 32]);
+                assert_eq!(root.completing_block_hash, hash(1_007));
+                assert_eq!(root.completing_block_height, 1_007);
             });
     }
 

@@ -155,6 +155,10 @@ pub(crate) fn sync_historical(
         request_bytes,
     )?;
     let (tip_height, tip_hash) = probe.source_tip.ok_or(PipelineError::NoSourceTip)?;
+    // The live-head reconciler validates durable records newer than Zakura's finalized tip.
+    if durable_tip.is_some_and(|tip| tip.height > tip_height.0) {
+        return Ok(initial_state);
+    }
     if let Some(durable_tip) = durable_tip
         && probe.blocks.first().is_none_or(|block| {
             block.height.0 != durable_tip.height || block.hash.0 != durable_tip.hash
