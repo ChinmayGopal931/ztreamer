@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn atomically_replaces_a_durable_reorg() {
+    fn replaces_only_the_volatile_head_without_rewriting_the_index() {
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
@@ -527,21 +527,89 @@ mod tests {
                     sync_head_once(&index, &mut source, &[], PipelineConfig::default())
                         .await
                         .unwrap();
-                assert_eq!(state.durable_tip().unwrap().height, 10);
 
-                source = Source((0..=21).map(|height| raw_branch_block(height, 8)).collect());
+                source = Source(
+                    (0..=20)
+                        .map(|height| raw_branch_block(height, 15))
+                        .collect(),
+                );
+                let (next_state, head) =
+                    sync_head_once(&index, &mut source, &head, PipelineConfig::default())
+                        .await
+                        .unwrap();
+
+                assert_eq!(next_state, state);
+                assert_eq!(head.first().unwrap().height, 11);
+                assert_eq!(head[4].hash, branch_hash(15));
+                assert_eq!(head.last().unwrap().hash, branch_hash(20));
+            });
+    }
+
+    #[test]
+    fn rolls_the_durable_tip_back_to_a_shorter_chain() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let index =
+                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap();
+                let mut source = Source((0..=20).map(raw_block).collect());
+                let (_, head) = sync_head_once(&index, &mut source, &[], PipelineConfig::default())
+                    .await
+                    .unwrap();
+
+                source = Source((0..=5).map(raw_block).collect());
                 let (state, head) =
                     sync_head_once(&index, &mut source, &head, PipelineConfig::default())
                         .await
                         .unwrap();
 
-                assert_eq!(state.durable_tip().unwrap().height, 11);
-                assert_eq!(
-                    index.read_block(state.generation(), 8).unwrap().hash,
-                    branch_hash(8)
+                assert_eq!(state.durable_tip().unwrap().height, 5);
+                assert!(head.is_empty());
+                assert!(
+                    index
+                        .read_block_by_hash(state.generation(), hash(6))
+                        .unwrap()
+                        .is_none()
                 );
-                assert_eq!(head.first().unwrap().height, 12);
-                assert_eq!(head.last().unwrap().height, 21);
+                index.verify_continuity().unwrap();
+            });
+    }
+
+    #[test]
+    fn atomically_replaces_a_durable_reorg() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let index =
+                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap();
+                let mut source = Source((0..=120).map(raw_block).collect());
+                let (state, head) =
+                    sync_head_once(&index, &mut source, &[], PipelineConfig::default())
+                        .await
+                        .unwrap();
+                assert_eq!(state.durable_tip().unwrap().height, 110);
+
+                source = Source(
+                    (0..=121)
+                        .map(|height| raw_branch_block(height, 21))
+                        .collect(),
+                );
+                let (state, head) =
+                    sync_head_once(&index, &mut source, &head, PipelineConfig::default())
+                        .await
+                        .unwrap();
+
+                assert_eq!(state.durable_tip().unwrap().height, 111);
+                assert_eq!(
+                    index.read_block(state.generation(), 21).unwrap().hash,
+                    branch_hash(21)
+                );
+                assert_eq!(head.first().unwrap().height, 112);
+                assert_eq!(head.last().unwrap().height, 121);
                 index.verify_continuity().unwrap();
             });
     }
@@ -562,7 +630,7 @@ mod tests {
 
                 source = Source(
                     (0..=121)
-                        .map(|height| raw_branch_block(height, 10))
+                        .map(|height| raw_branch_block(height, 20))
                         .collect(),
                 );
                 assert!(matches!(
@@ -576,8 +644,8 @@ mod tests {
 
                 assert_eq!(state.durable_tip().unwrap().height, 111);
                 assert_eq!(
-                    index.read_block(state.generation(), 10).unwrap().hash,
-                    branch_hash(10)
+                    index.read_block(state.generation(), 20).unwrap().hash,
+                    branch_hash(20)
                 );
                 assert_eq!(head.first().unwrap().height, 112);
                 assert_eq!(head.last().unwrap().height, 121);
@@ -600,7 +668,7 @@ mod tests {
                     .unwrap();
 
                 let mut source = Source(
-                    (0..=121)
+                    (0..=105)
                         .map(|height| raw_branch_block(height, 100))
                         .collect(),
                 );
@@ -613,12 +681,15 @@ mod tests {
                     recover_deep_reorg(&index, &mut source, &[], PipelineConfig::default())
                         .await
                         .unwrap();
+                assert_eq!(state.durable_tip().unwrap().height, 99);
                 assert_eq!(
-                    index.read_block(state.generation(), 100).unwrap().hash,
-                    branch_hash(100)
+                    index.read_block(state.generation(), 99).unwrap().hash,
+                    hash(99)
                 );
-                assert_eq!(head.first().unwrap().height, 112);
-                assert_eq!(head.last().unwrap().height, 121);
+                assert_eq!(head.first().unwrap().height, 100);
+                assert_eq!(head.first().unwrap().hash, branch_hash(100));
+                assert_eq!(head.last().unwrap().height, 105);
+                index.verify_continuity().unwrap();
             });
     }
 
