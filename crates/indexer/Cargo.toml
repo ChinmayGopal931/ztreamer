@@ -20,3 +20,4 @@ zakurad.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+zakura-test.workspace = true

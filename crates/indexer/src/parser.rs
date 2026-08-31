@@ -555,13 +555,9 @@ mod tests {
         serialization::{ZcashDeserialize as _, ZcashSerialize as _},
         transaction::{LockTime, Transaction},
     };
-
-    const SAPLING_BLOCK: &str =
-        include_str!("../../../../zakura/crates/zakura-test/src/vectors/block-main-0-949-496.txt");
-    const ORCHARD_BLOCK: &str =
-        include_str!("../../../../zakura/crates/zakura-test/src/vectors/block-test-1-842-421.txt");
-    const SAPLING_SPEND_BLOCK: &str =
-        include_str!("../../../../zakura/crates/zakura-test/src/vectors/block-main-1-687-106.txt");
+    use zakura_test::vectors::{
+        BLOCK_MAINNET_949496_BYTES, BLOCK_MAINNET_1687106_BYTES, BLOCK_TESTNET_1842421_BYTES,
+    };
 
     #[test]
     fn selective_parser_matches_full_zakura_parse() {
@@ -569,8 +565,12 @@ mod tests {
         let mut saw_sapling_spend = false;
         let mut saw_orchard = false;
 
-        for encoded_block in [SAPLING_BLOCK, SAPLING_SPEND_BLOCK, ORCHARD_BLOCK] {
-            let bytes = hex::decode(encoded_block.trim()).unwrap();
+        for encoded_block in [
+            &*BLOCK_MAINNET_949496_BYTES,
+            &*BLOCK_MAINNET_1687106_BYTES,
+            &*BLOCK_TESTNET_1842421_BYTES,
+        ] {
+            let bytes = encoded_block.to_vec();
             let block = Block::zcash_deserialize(bytes.as_slice()).unwrap();
             let height = block.coinbase_height().unwrap();
             let parsed = parse_block(&RawIndexBlock {
@@ -613,8 +613,7 @@ mod tests {
 
     #[test]
     fn v6_keeps_orchard_and_ironwood_separate() {
-        let bytes = hex::decode(ORCHARD_BLOCK.trim()).unwrap();
-        let block = Block::zcash_deserialize(bytes.as_slice()).unwrap();
+        let block = Block::zcash_deserialize(BLOCK_TESTNET_1842421_BYTES.as_slice()).unwrap();
         let shielded = block
             .transactions
             .iter()
