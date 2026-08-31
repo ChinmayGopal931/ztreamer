@@ -330,23 +330,16 @@ mod tests {
     #[tokio::test]
     async fn forwards_streaming_compact_ranges() {
         let directory = tempfile::tempdir().unwrap();
-        let index = Arc::new(
-            Index::open(
-                directory.path(),
-                10 * 1024 * 1024,
-                "Mainnet",
-                [9; 32],
-                false,
-            )
-            .unwrap(),
-        );
+        let index =
+            Arc::new(Index::open(directory.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap());
         let (_state, read_state, _tip, _change) = zakura_state::init(
             Config::ephemeral(),
             &Network::Mainnet,
             block::Height::MAX,
             0,
         )
-        .await;
+        .await
+        .expect("ephemeral state initializes");
         let compact = CompactService::new(index, IndexState::default(), "main", read_state);
         compact
             .publish_head(

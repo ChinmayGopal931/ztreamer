@@ -468,8 +468,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let index =
-                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap();
+                let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap();
                 let mut source = Source((0..=12).map(raw_block).collect());
                 let (state, volatile) =
                     sync_head_once(&index, &mut source, &[], PipelineConfig::default())
@@ -494,8 +493,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let index =
-                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap();
+                let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap();
                 let mut source = Source((0..=20).map(raw_block).collect());
                 let (state, head) =
                     sync_head_once(&index, &mut source, &[], PipelineConfig::default())
@@ -520,8 +518,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let index =
-                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap();
+                let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap();
                 let mut source = Source((0..=20).map(raw_block).collect());
                 let (state, head) =
                     sync_head_once(&index, &mut source, &[], PipelineConfig::default())
@@ -552,8 +549,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let index =
-                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap();
+                let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap();
                 let mut source = Source((0..=20).map(raw_block).collect());
                 let (_, head) = sync_head_once(&index, &mut source, &[], PipelineConfig::default())
                     .await
@@ -584,8 +580,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let index =
-                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap();
+                let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap();
                 let mut source = Source((0..=120).map(raw_block).collect());
                 let (state, head) =
                     sync_head_once(&index, &mut source, &[], PipelineConfig::default())
@@ -621,8 +616,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let index =
-                    Index::open(dir.path(), 20 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap();
+                let index = Index::open(dir.path(), 20 * 1024 * 1024, "Mainnet", [9; 32]).unwrap();
                 let mut source = Source((0..=120).map(raw_block).collect());
                 let (_, head) = sync_head_once(&index, &mut source, &[], PipelineConfig::default())
                     .await
@@ -660,8 +654,7 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let index =
-                    Index::open(dir.path(), 20 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap();
+                let index = Index::open(dir.path(), 20 * 1024 * 1024, "Mainnet", [9; 32]).unwrap();
                 let mut source = Source((0..=120).map(raw_block).collect());
                 sync_head_once(&index, &mut source, &[], PipelineConfig::default())
                     .await

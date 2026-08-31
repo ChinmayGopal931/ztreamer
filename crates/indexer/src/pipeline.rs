@@ -141,7 +141,6 @@ pub(crate) fn sync_historical(
     db: &ZakuraDb,
     config: PipelineConfig,
 ) -> Result<IndexState, PipelineError> {
-    let pipeline_started = Instant::now();
     validate_config(config)?;
     let initial_state = index.state()?;
     let durable_tip = initial_state.durable_tip();
@@ -311,7 +310,6 @@ pub(crate) fn sync_historical(
             fetch_stats.bytes += stats.bytes;
         }
         let (state, write_stats) = writer.join().map_err(|_| PipelineError::Panic)??;
-        let compact_wall = pipeline_started.elapsed();
         info!(
             fetch_read_seconds = fetch_stats.read.as_secs_f64(),
             fetch_header_read_seconds = fetch_stats.header_read.as_secs_f64(),
@@ -334,21 +332,6 @@ pub(crate) fn sync_historical(
             written_blocks = write_stats.blocks,
             "historical pipeline stage totals"
         );
-        info!(
-            elapsed_seconds = compact_wall.as_secs_f64(),
-            blocks = write_stats.blocks,
-            "compact block index build complete"
-        );
-        if index.tree_index_enabled() {
-            let tree = index.flush_tree_index()?;
-            info!(
-                elapsed_seconds = tree.wall.as_secs_f64(),
-                compute_seconds = tree.compute.as_secs_f64(),
-                jobs = tree.jobs,
-                blocks = tree.blocks,
-                "tree state index build complete"
-            );
-        }
         Ok(state)
     })
 }

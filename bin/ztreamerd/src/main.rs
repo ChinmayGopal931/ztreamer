@@ -78,6 +78,12 @@ async fn main() -> Result<()> {
     config.metrics.endpoint_addr = Some(cli.metrics_listen);
     let _metrics = MetricsEndpoint::new(&config.metrics).context("start Prometheus endpoint")?;
     let network = config.network.network.clone();
+    let index = Arc::new(Index::open(
+        &cli.index_dir,
+        cli.index_map_size.get(),
+        &network.to_string(),
+        network.genesis_hash().0,
+    )?);
 
     let p2p = Arc::new(P2pCompactService::pending());
     info!(network = %network, "starting embedded Zakura");
@@ -118,16 +124,6 @@ async fn main() -> Result<()> {
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
         }
     }
-
-    let tree_index = client.database().is_vct_synced();
-    info!(tree_index, "selected tree-state source");
-    let index = Arc::new(Index::open(
-        &cli.index_dir,
-        cli.index_map_size.get(),
-        &network.to_string(),
-        network.genesis_hash().0,
-        tree_index,
-    )?);
 
     let mut pipeline = PipelineConfig::default();
     if let Some(fetch_workers) = cli.fetch_workers {

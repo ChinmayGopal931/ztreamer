@@ -10,7 +10,6 @@ use crate::Digest;
 use crate::codec::{
     CodecError, CompactBlockRecord, RangeDecoder, TreeSizes, decode_range_record, encode_range,
 };
-use crate::tree::{Anchor, TreeQueue, TreeStateResult, TreeStats};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const RANGE_SIZE: u32 = 1_000;
@@ -20,6 +19,7 @@ pub const SEAL_DEPTH: u32 = 100;
 const STATE_FORMAT_VERSION: u8 = 1;
 const STATE_BYTES: usize = 62;
 const STATE: &[u8] = b"state";
+
 type HeightDb = Database<U32<BigEndian>, Bytes>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,19 +97,15 @@ pub enum IndexError {
     Sealed { height: u32 },
     #[error("replacement suffix does not connect at height {height}")]
     Replacement { height: u32 },
-    #[error("tree-state indexer failed: {0}")]
-    Tree(String),
 }
 
-/// Ztreamer's LMDB compact and tree-state index.
+/// Ztreamer's four-database LMDB index.
 pub struct Index {
     env: Env,
     metadata: Database<Bytes, Bytes>,
     sealed_ranges: HeightDb,
     mutable_blocks: HeightDb,
     hash_to_height: Database<Bytes, U32<BigEndian>>,
-    tree_anchors: HeightDb,
-    tree_queue: Option<TreeQueue>,
 }
 
 impl Index {
@@ -119,14 +115,13 @@ impl Index {
         map_size: usize,
         network: &str,
         genesis_hash: Digest,
-        tree_index: bool,
     ) -> Result<Self, IndexError> {
         fs::create_dir_all(path.as_ref())?;
         // SAFETY: callers must not open this path with incompatible LMDB options in this process.
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size)
-                .max_dbs(5)
+                .max_dbs(4)
                 .open(path.as_ref())?
         };
         let mut txn = env.write_txn()?;
@@ -134,7 +129,6 @@ impl Index {
         let sealed_ranges = env.create_database(&mut txn, Some("sealed_ranges"))?;
         let mutable_blocks = env.create_database(&mut txn, Some("mutable_blocks"))?;
         let hash_to_height = env.create_database(&mut txn, Some("hash_to_height"))?;
-        let tree_anchors = env.create_database(&mut txn, Some("tree_anchors"))?;
 
         let identity = identity(network, genesis_hash);
         match metadata.get(&txn, b"identity".as_slice())? {
@@ -144,18 +138,14 @@ impl Index {
         }
         txn.commit()?;
 
-        let tree_queue = tree_index.then(|| TreeQueue::start(env.clone(), tree_anchors));
         let index = Self {
             env,
             metadata,
             sealed_ranges,
             mutable_blocks,
             hash_to_height,
-            tree_anchors,
-            tree_queue,
         };
         index.verify_continuity()?;
-        index.queue_missing_tree_anchors()?;
         record_state_metrics(index.state()?);
         Ok(index)
     }
@@ -163,103 +153,6 @@ impl Index {
     pub fn state(&self) -> Result<IndexState, IndexError> {
         let txn = self.env.read_txn()?;
         read_state(self.metadata, &txn)
-    }
-
-    pub fn tree_state_with_suffix(
-        &self,
-        generation: u64,
-        height: u32,
-        suffix: &[CompactBlockRecord],
-    ) -> Result<TreeStateResult, IndexError> {
-        if !self.tree_index_enabled() {
-            return Err(IndexError::Tree("tree-state index is disabled".into()));
-        }
-        self.derive_tree_state(generation, height, suffix)
-    }
-
-    fn derive_tree_state(
-        &self,
-        generation: u64,
-        height: u32,
-        suffix: &[CompactBlockRecord],
-    ) -> Result<TreeStateResult, IndexError> {
-        let txn = self.env.read_txn()?;
-        let state = self.read_generation(&txn, generation)?;
-        let mut anchor_height = height
-            .checked_add(1)
-            .map(|next| next / RANGE_SIZE * RANGE_SIZE)
-            .and_then(|next| next.checked_sub(1));
-        let mut anchor = None;
-        while let Some(candidate) = anchor_height {
-            if let Some(bytes) = self.tree_anchors.get(&txn, &candidate)? {
-                let decoded = Anchor::decode(bytes)?;
-                if decoded.hash() == self.read_record(&txn, state, candidate)?.hash {
-                    anchor = Some(decoded);
-                    break;
-                }
-            }
-            anchor_height = candidate.checked_sub(RANGE_SIZE);
-        }
-        let mut anchor = anchor.unwrap_or_default();
-        let start = anchor_height.map_or(0, |anchor| anchor + 1);
-        let durable_tip = state
-            .durable_tip()
-            .ok_or(IndexError::Coverage { height })?
-            .height;
-        let mut blocks = (start..=height.min(durable_tip))
-            .map(|block_height| self.read_record(&txn, state, block_height))
-            .collect::<Result<Vec<_>, _>>()?;
-        if height > durable_tip {
-            let mut expected = durable_tip.checked_add(1).ok_or(IndexError::Overflow)?;
-            for block in suffix.iter().filter(|block| block.height <= height) {
-                if block.height != expected {
-                    return Err(IndexError::Coverage { height: expected });
-                }
-                blocks.push(block.clone());
-                expected = expected.checked_add(1).ok_or(IndexError::Overflow)?;
-            }
-            if expected <= height {
-                return Err(IndexError::Coverage { height: expected });
-            }
-        }
-        anchor.append_blocks(&blocks)?;
-        Ok(anchor.into_result())
-    }
-
-    pub fn tree_index_enabled(&self) -> bool {
-        self.tree_queue.is_some()
-    }
-
-    pub(crate) fn flush_tree_index(&self) -> Result<TreeStats, IndexError> {
-        match &self.tree_queue {
-            Some(queue) => queue.flush().map_err(IndexError::Tree),
-            None => Ok(Default::default()),
-        }
-    }
-
-    fn queue_missing_tree_anchors(&self) -> Result<(), IndexError> {
-        let Some(tree_queue) = &self.tree_queue else {
-            return Ok(());
-        };
-        let txn = self.env.read_txn()?;
-        let state = read_state(self.metadata, &txn)?;
-        let anchored = self.tree_anchors.last(&txn)?.map(|(height, _)| height);
-        if let Some(sealed) = state.sealed_through {
-            let mut start = anchored.map_or(0, |height| height + 1);
-            while start <= sealed {
-                let bytes = self
-                    .sealed_ranges
-                    .get(&txn, &start)?
-                    .ok_or(IndexError::IncompleteRange { start })?;
-                let range = RangeDecoder::new(bytes)?;
-                let blocks = (0..RANGE_SIZE as usize)
-                    .map(|offset| range.record(offset))
-                    .collect::<Result<_, _>>()?;
-                tree_queue.range(blocks);
-                start = start.checked_add(RANGE_SIZE).ok_or(IndexError::Overflow)?;
-            }
-        }
-        Ok(())
     }
 
     /// Reads one block from a generation-pinned LMDB snapshot.
@@ -493,7 +386,6 @@ impl Index {
     pub fn write(&self, batch: WriteBatch) -> Result<IndexState, IndexError> {
         let mut txn = self.env.write_txn()?;
         let mut state = read_state(self.metadata, &txn)?;
-        let mut sealed = Vec::new();
         let WriteBatch {
             base_generation,
             seal_through,
@@ -560,9 +452,6 @@ impl Index {
                 self.mutable_blocks.delete(&mut txn, &height)?;
             }
             state.sealed_through = Some(end);
-            if self.tree_index_enabled() {
-                sealed.push(range);
-            }
             start = end.checked_add(1).ok_or(IndexError::Overflow)?;
         }
         for record in records {
@@ -579,11 +468,6 @@ impl Index {
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
         txn.commit()?;
-        if let Some(queue) = &self.tree_queue {
-            for range in sealed {
-                queue.range(range);
-            }
-        }
         record_state_metrics(state);
         Ok(state)
     }
@@ -663,7 +547,7 @@ impl Index {
             .map_or(ancestor_record.end_tree_sizes, |record| {
                 record.end_tree_sizes
             });
-        let sealed = self.pack_sealed_ranges(&mut txn, seal_through, &mut state)?;
+        self.pack_sealed_ranges(&mut txn, seal_through, &mut state)?;
         state.generation = state
             .generation
             .checked_add(1)
@@ -671,11 +555,6 @@ impl Index {
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
         txn.commit()?;
-        if let Some(queue) = &self.tree_queue {
-            for range in sealed {
-                queue.range(range);
-            }
-        }
         record_state_metrics(state);
         Ok(state)
     }
@@ -688,10 +567,6 @@ impl Index {
         replacement: Vec<CompactBlockRecord>,
         seal_through: Option<u32>,
     ) -> Result<IndexState, IndexError> {
-        // Fence old jobs before atomically invalidating the anchors they could recreate.
-        if let Some(queue) = &self.tree_queue {
-            let _ = queue.flush();
-        }
         let mut txn = self.env.write_txn()?;
         let mut state = read_state(self.metadata, &txn)?;
         if state.generation != base_generation {
@@ -708,15 +583,6 @@ impl Index {
         }
 
         let affected_start = common_ancestor.height - common_ancestor.height % RANGE_SIZE;
-        let first_affected_anchor = affected_start
-            .checked_add(RANGE_SIZE - 1)
-            .ok_or(IndexError::Overflow)?;
-        while let Some((height, _)) = self.tree_anchors.last(&txn)? {
-            if height < first_affected_anchor {
-                break;
-            }
-            self.tree_anchors.delete(&mut txn, &height)?;
-        }
         let old_records = (affected_start..=old_tip.height)
             .map(|height| self.read_record(&txn, state, height))
             .collect::<Result<Vec<_>, _>>()?;
@@ -749,6 +615,7 @@ impl Index {
                 .checked_sub(1)
                 .filter(|height| *height <= old_sealed);
         }
+
         for record in &canonical {
             let encoded = record.encode()?;
             self.mutable_blocks
@@ -761,7 +628,7 @@ impl Index {
             .expect("the common-ancestor prefix is non-empty");
         state.durable_tip = Some(BlockId::new(tip.height, tip.hash));
         state.tree_sizes = tip.end_tree_sizes;
-        let sealed = self.pack_sealed_ranges(&mut txn, seal_through, &mut state)?;
+        self.pack_sealed_ranges(&mut txn, seal_through, &mut state)?;
         state.generation = state
             .generation
             .checked_add(1)
@@ -769,12 +636,6 @@ impl Index {
         let encoded = encode_state(state);
         self.metadata.put(&mut txn, STATE, encoded.as_slice())?;
         txn.commit()?;
-        if let Some(queue) = &self.tree_queue {
-            queue.reset(affected_start);
-            for range in sealed {
-                queue.range(range);
-            }
-        }
         record_state_metrics(state);
         Ok(state)
     }
@@ -784,11 +645,10 @@ impl Index {
         txn: &mut RwTxn<'_>,
         seal_cutoff: Option<u32>,
         state: &mut IndexState,
-    ) -> Result<Vec<Vec<CompactBlockRecord>>, IndexError> {
+    ) -> Result<(), IndexError> {
         let Some(seal_cutoff) = seal_cutoff else {
-            return Ok(Vec::new());
+            return Ok(());
         };
-        let mut sealed = Vec::new();
         let mut start = state.sealed_through.map_or(Ok(0), |height| {
             height.checked_add(1).ok_or(IndexError::Overflow)
         })?;
@@ -819,12 +679,9 @@ impl Index {
                 self.mutable_blocks.delete(txn, &height)?;
             }
             state.sealed_through = Some(end);
-            if self.tree_index_enabled() {
-                sealed.push(records);
-            }
             start = end.checked_add(1).ok_or(IndexError::Overflow)?;
         }
-        Ok(sealed)
+        Ok(())
     }
 }
 
@@ -912,42 +769,21 @@ mod tests {
     use crate::{codec::decode_range_record, ingest::OrderedBuilder, parser::PreparedCompactBlock};
 
     #[test]
-    fn creates_databases_and_checks_chain_identity() {
+    fn creates_four_databases_and_checks_chain_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index");
 
-        drop(Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32], false).unwrap());
-        drop(Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32], false).unwrap());
-        assert!(Index::open(&path, 10 * 1024 * 1024, "Testnet", [1; 32], false).is_err());
-        assert!(Index::open(&path, 10 * 1024 * 1024, "Mainnet", [2; 32], false).is_err());
-    }
-
-    #[test]
-    fn tree_index_is_opt_in() {
-        let dir = tempfile::tempdir().unwrap();
-        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32], false).unwrap();
-        let state = index.write(batch(&index, 0..=1_000, 1_100)).unwrap();
-
-        assert!(!index.tree_index_enabled());
-        assert_eq!(index.flush_tree_index().unwrap().jobs, 0);
-        assert!(
-            index
-                .tree_anchors
-                .last(&index.env.read_txn().unwrap())
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(
-            index.tree_state_with_suffix(state.generation(), 999, &[]),
-            Err(IndexError::Tree(_))
-        ));
+        drop(Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap());
+        drop(Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap());
+        assert!(Index::open(&path, 10 * 1024 * 1024, "Testnet", [1; 32]).is_err());
+        assert!(Index::open(&path, 10 * 1024 * 1024, "Mainnet", [2; 32]).is_err());
     }
 
     #[test]
     fn atomically_writes_restarts_and_packs_sealed_ranges() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index");
-        let index = Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32], true).unwrap();
+        let index = Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         let stale = batch(&index, 0..=0, 1_100);
         let state = index.write(batch(&index, 0..=1_000, 1_100)).unwrap();
 
@@ -968,20 +804,6 @@ mod tests {
         );
         drop(txn);
 
-        let tree_stats = index.flush_tree_index().unwrap();
-        assert_eq!(tree_stats.jobs, 1);
-        let trees = index
-            .tree_state_with_suffix(state.generation(), 999, &[])
-            .unwrap();
-        assert_eq!(
-            trees.sapling,
-            zakura_chain::sapling::tree::NoteCommitmentTree::default().to_rpc_bytes()
-        );
-        assert_eq!(
-            trees.orchard,
-            zakura_chain::orchard::tree::NoteCommitmentTree::default().to_rpc_bytes()
-        );
-
         assert!(matches!(
             index.write(stale),
             Err(IndexError::StaleBatch {
@@ -991,7 +813,7 @@ mod tests {
         assert_eq!(index.state().unwrap(), state);
 
         drop(index);
-        let reopened = Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32], true).unwrap();
+        let reopened = Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         assert_eq!(reopened.state().unwrap(), state);
     }
 
@@ -999,7 +821,7 @@ mod tests {
     fn restart_rejects_a_gap_in_mutable_coverage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index");
-        let index = Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32], false).unwrap();
+        let index = Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         index.write(batch(&index, 0..=10, 20)).unwrap();
         let mut txn = index.env.write_txn().unwrap();
         index.mutable_blocks.delete(&mut txn, &5).unwrap();
@@ -1007,7 +829,7 @@ mod tests {
         drop(index);
 
         assert!(matches!(
-            Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32], false),
+            Index::open(&path, 10 * 1024 * 1024, "Mainnet", [1; 32]),
             Err(IndexError::Continuity { .. })
         ));
     }
@@ -1015,7 +837,7 @@ mod tests {
     #[test]
     fn persistence_and_sealing_use_exact_depth_boundaries() {
         let dir = tempfile::tempdir().unwrap();
-        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32], false).unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         let mut builder = OrderedBuilder::new(IndexState::default(), 10 * 1024 * 1024).unwrap();
         builder.push(prepared(0)).unwrap();
 
@@ -1079,7 +901,7 @@ mod tests {
     #[test]
     fn aborted_range_pack_keeps_every_mutable_row() {
         let dir = tempfile::tempdir().unwrap();
-        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32], false).unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         let state = index.write(batch(&index, 0..=999, 1_009)).unwrap();
         assert_eq!(state.durable_tip().unwrap().height, 999);
 
@@ -1114,7 +936,7 @@ mod tests {
     #[test]
     fn reads_sealed_and_mutable_ranges_in_both_directions() {
         let dir = tempfile::tempdir().unwrap();
-        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32], false).unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         let state = index.write(batch(&index, 0..=1_005, 1_100)).unwrap();
 
         assert_eq!(
@@ -1156,7 +978,7 @@ mod tests {
     #[test]
     fn atomically_replaces_a_mutable_suffix() {
         let dir = tempfile::tempdir().unwrap();
-        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32], false).unwrap();
+        let index = Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         let old = index.write(batch(&index, 0..=50, 60)).unwrap();
         let ancestor = BlockId::new(30, hash(30));
         let mut previous_hash = ancestor.hash;
@@ -1219,7 +1041,7 @@ mod tests {
     #[test]
     fn deep_reorg_rebuilds_the_affected_sealed_range() {
         let dir = tempfile::tempdir().unwrap();
-        let index = Index::open(dir.path(), 20 * 1024 * 1024, "Mainnet", [1; 32], true).unwrap();
+        let index = Index::open(dir.path(), 20 * 1024 * 1024, "Mainnet", [1; 32]).unwrap();
         let old = index.write(batch(&index, 0..=1_100, 1_200)).unwrap();
         assert_eq!(old.sealed_through(), Some(999));
 
@@ -1243,7 +1065,6 @@ mod tests {
         let state = index
             .replace_deep_suffix(old.generation(), common, replacement, Some(1_010))
             .unwrap();
-        index.flush_tree_index().unwrap();
 
         assert_eq!(state.sealed_through(), Some(999));
         assert_eq!(

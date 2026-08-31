@@ -24,7 +24,6 @@ Other than the above caveats and gaps below, `ztreamer` has full request/respons
 ## benchmarks
 
 Still need to do another run with better memory profiling, but system memory usage peaked at 5GB while running other workloads.
-If the underlying node didnt VCT fast sync and a tree state index doesnt have to be built:
 
 ```
    - Historical indexing: `116.61s`
@@ -38,8 +37,5 @@ If the underlying node didnt VCT fast sync and a tree state index doesnt have to
    - Historical indexing CPU: ~`1.77` cores average / `5.5%` of 32 logical CPUs
    - System I/O wait during historical indexing: ~`32.7%`
  ```
-
- With a VCT fast synced node, historical indexing took 229.52s on the same hardware.
-
 
 I have yet to bench supplying clients, which will come next.
