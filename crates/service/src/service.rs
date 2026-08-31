@@ -329,14 +329,14 @@ impl CompactService {
     async fn record(
         &self,
         request: proto::BlockId,
+        snapshot: &ServingSnapshot,
     ) -> Result<ztreamer_indexer::codec::CompactBlockRecord, Status> {
-        let snapshot = self.snapshot();
-        ensure_ready(&snapshot)?;
+        ensure_ready(snapshot)?;
         if request.hash.is_empty() {
             let height = u32::try_from(request.height)
                 .map_err(|_| Status::invalid_argument("block height exceeds u32"))?;
             if let Some(record) = snapshot.volatile(height) {
-                ensure_tip_ready(&snapshot)?;
+                ensure_tip_ready(snapshot)?;
                 return Ok(record.clone());
             }
         } else {
@@ -350,7 +350,7 @@ impl CompactService {
                 .iter()
                 .find(|record| record.hash == hash)
             {
-                ensure_tip_ready(&snapshot)?;
+                ensure_tip_ready(snapshot)?;
                 return Ok(record.clone());
             }
         }
@@ -379,7 +379,8 @@ impl CompactService {
         request: proto::BlockId,
         nullifiers: bool,
     ) -> Result<proto::CompactBlock, Status> {
-        let record = self.record(request).await?;
+        let snapshot = self.snapshot();
+        let record = self.record(request, &snapshot).await?;
         let pools = PoolSelection::from_request(&[]).expect("empty pool selection is valid");
         Ok(if nullifiers {
             compact_block_nullifiers(&record, pools)
@@ -468,44 +469,63 @@ impl CompactService {
         &self,
         request: proto::BlockId,
     ) -> Result<proto::TreeState, Status> {
-        let record = self.record(request).await?;
-        let source = self.zakura.clone();
+        let snapshot = self.snapshot();
+        let record = self.record(request, &snapshot).await?;
         let hash = block::Hash(record.hash);
-        let (sapling, orchard, ironwood) = tokio::try_join!(
-            source
-                .clone()
-                .oneshot(ReadRequest::SaplingTree(hash.into())),
-            source
-                .clone()
-                .oneshot(ReadRequest::OrchardTree(hash.into())),
-            source.oneshot(ReadRequest::IronwoodTree(hash.into())),
-        )
-        .map_err(source_status)?;
+        let height = record.height;
+        let time = record.time;
+        let (sapling_tree, orchard_tree, ironwood_tree) = if self.index.tree_index_enabled() {
+            let index = Arc::clone(&self.index);
+            let trees = tokio::task::spawn_blocking(move || {
+                index.tree_state_with_suffix(snapshot.generation, height, &snapshot.volatile_head)
+            })
+            .await
+            .map_err(|_| Status::internal("tree-state task panicked"))?
+            .map_err(index_status)?;
+            (
+                hex::encode(trees.sapling),
+                hex::encode(trees.orchard),
+                hex::encode(trees.ironwood),
+            )
+        } else {
+            let source = self.zakura.clone();
+            let (sapling, orchard, ironwood) = tokio::try_join!(
+                source
+                    .clone()
+                    .oneshot(ReadRequest::SaplingTree(hash.into())),
+                source
+                    .clone()
+                    .oneshot(ReadRequest::OrchardTree(hash.into())),
+                source.oneshot(ReadRequest::IronwoodTree(hash.into())),
+            )
+            .map_err(source_status)?;
 
-        let sapling_tree = match sapling {
-            ReadResponse::SaplingTree(tree) => tree
-                .map(|tree| hex::encode(tree.to_rpc_bytes()))
-                .unwrap_or_default(),
-            _ => return Err(Status::internal("unexpected Sapling tree response")),
-        };
-        let orchard_tree = match orchard {
-            ReadResponse::OrchardTree(tree) => tree
-                .map(|tree| hex::encode(tree.to_rpc_bytes()))
-                .unwrap_or_default(),
-            _ => return Err(Status::internal("unexpected Orchard tree response")),
-        };
-        let ironwood_tree = match ironwood {
-            ReadResponse::IronwoodTree(tree) => tree
-                .map(|tree| hex::encode(tree.to_rpc_bytes()))
-                .unwrap_or_default(),
-            _ => return Err(Status::internal("unexpected Ironwood tree response")),
+            let sapling_tree = match sapling {
+                ReadResponse::SaplingTree(tree) => tree
+                    .map(|tree| hex::encode(tree.to_rpc_bytes()))
+                    .unwrap_or_default(),
+                _ => return Err(Status::internal("unexpected Sapling tree response")),
+            };
+            let orchard_tree = match orchard {
+                ReadResponse::OrchardTree(tree) => tree
+                    .map(|tree| hex::encode(tree.to_rpc_bytes()))
+                    .unwrap_or_default(),
+                _ => return Err(Status::internal("unexpected Orchard tree response")),
+            };
+            let ironwood_tree = match ironwood {
+                ReadResponse::IronwoodTree(tree) => tree
+                    .map(|tree| hex::encode(tree.to_rpc_bytes()))
+                    .unwrap_or_default(),
+                _ => return Err(Status::internal("unexpected Ironwood tree response")),
+            };
+            (sapling_tree, orchard_tree, ironwood_tree)
         };
 
         Ok(proto::TreeState {
             network: self.chain_name.to_string(),
-            height: u64::from(record.height),
+            height: u64::from(height),
             hash: hash.to_string(),
-            time: record.time,
+            time,
             sapling_tree,
             orchard_tree,
             ironwood_tree,
@@ -1072,7 +1092,7 @@ mod tests {
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
                 let index = Arc::new(
-                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap(),
+                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap(),
                 );
                 let (_state_service, read_service, _tip, _change) = zakura_state::init(
                     Config::ephemeral(),
@@ -1123,7 +1143,7 @@ mod tests {
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
                 let index = Arc::new(
-                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap(),
+                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap(),
                 );
                 let state = index_through(&index, 1_005);
                 let (_state_service, read_service, _tip, _change) = zakura_state::init(
@@ -1306,7 +1326,7 @@ mod tests {
             .block_on(async {
                 let dir = tempfile::tempdir().unwrap();
                 let index = Arc::new(
-                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap(),
+                    Index::open(dir.path(), 10 * 1024 * 1024, "Mainnet", [9; 32], false).unwrap(),
                 );
                 let state = index_through(&index, 1_005);
                 let (_state_service, read_service, _tip, _change) = zakura_state::init(
@@ -1328,6 +1348,69 @@ mod tests {
                 assert_eq!(root.root_hash, vec![7; 32]);
                 assert_eq!(root.completing_block_hash, hash(1_007));
                 assert_eq!(root.completing_block_height, 1_007);
+            });
+    }
+
+    #[test]
+    fn tree_state_source_follows_index_mode() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (_state_service, read_service, _tip, _change) = zakura_state::init(
+                    Config::ephemeral(),
+                    &Network::Mainnet,
+                    block::Height::MAX,
+                    0,
+                )
+                .await;
+                let dir = tempfile::tempdir().unwrap();
+
+                let legacy_index = Arc::new(
+                    Index::open(
+                        dir.path().join("legacy"),
+                        10 * 1024 * 1024,
+                        "Mainnet",
+                        [9; 32],
+                        false,
+                    )
+                    .unwrap(),
+                );
+                let legacy_state = index_through(&legacy_index, 0);
+                let legacy =
+                    CompactService::new(legacy_index, legacy_state, "main", read_service.clone())
+                        .tree_state(proto::BlockId {
+                            height: 0,
+                            hash: Vec::new(),
+                        })
+                        .await
+                        .unwrap();
+                assert!(legacy.sapling_tree.is_empty());
+
+                let local_index = Arc::new(
+                    Index::open(
+                        dir.path().join("local"),
+                        10 * 1024 * 1024,
+                        "Mainnet",
+                        [9; 32],
+                        true,
+                    )
+                    .unwrap(),
+                );
+                let local_state = index_through(&local_index, 1_000);
+                let local = CompactService::new(local_index, local_state, "main", read_service)
+                    .tree_state(proto::BlockId {
+                        height: 999,
+                        hash: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    local.sapling_tree,
+                    hex::encode(
+                        zakura_chain::sapling::tree::NoteCommitmentTree::default().to_rpc_bytes()
+                    )
+                );
             });
     }
 

@@ -7694,6 +7694,7 @@ dependencies = [
  "heed",
  "hex",
  "metrics",
+ "rayon",
  "serde",
  "serde-big-array",
  "tempfile",

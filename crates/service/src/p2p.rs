@@ -330,8 +330,16 @@ mod tests {
     #[tokio::test]
     async fn forwards_streaming_compact_ranges() {
         let directory = tempfile::tempdir().unwrap();
-        let index =
-            Arc::new(Index::open(directory.path(), 10 * 1024 * 1024, "Mainnet", [9; 32]).unwrap());
+        let index = Arc::new(
+            Index::open(
+                directory.path(),
+                10 * 1024 * 1024,
+                "Mainnet",
+                [9; 32],
+                false,
+            )
+            .unwrap(),
+        );
         let (_state, read_state, _tip, _change) = zakura_state::init(
             Config::ephemeral(),
             &Network::Mainnet,
