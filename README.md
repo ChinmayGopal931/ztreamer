@@ -8,17 +8,16 @@
 - currently, only a "direct" mode exists, comparable to zaino's "direct" mode
 
 ## `lightwallet-protocol` compatibility
-All methods are supported, but two intentionally break the protocol spec, and 2 are still pending.
+All methods are supported, but two intentionally break the protocol spec, and one is still pending.
 
 - `GetBlock` excludes transparent data, as no wallets try to access it and dont have a reason to.
 - `GetBlockRange` rejects transparent filters. We believe transparent range scanning is not worth the bandwidth tradeoff, which we see in wallet adoption -- if wallets end up using requests this way one day, we will add it.
-- `GetLightdInfo` is not fully populated yet.
 - `GetMempoolTx` is still unsupported.
 
 ## zaino parity
 Other than the above caveats and gaps below, `ztreamer` has full request/response parity with zaino's "direct" mode.
 
-23/27 JSON-RPC requests are served, with`getchaintips`, `getblockdeltas`, `getspentinfo`, and `gettxoutsetinfo` still pending.
+24/27 JSON-RPC requests are served, with `getblockdeltas`, `getspentinfo`, and `gettxoutsetinfo` still pending.
 
 
 ## benchmarks

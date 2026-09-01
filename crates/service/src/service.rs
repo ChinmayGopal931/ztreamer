@@ -11,6 +11,7 @@ use tonic::Status;
 use tower::ServiceExt;
 use zakura_chain::{
     block,
+    parameters::{ConsensusBranchId, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, Transaction},
@@ -560,14 +561,30 @@ impl CompactService {
 
     pub(crate) fn lightd_info(&self) -> proto::LightdInfo {
         let tip = self.snapshot().visible_tip;
+        let tip_height = tip.map_or(0, |tip| tip.height);
+        let network = self.zakura.db().network();
+        let next_upgrade = network
+            .activation_list()
+            .into_iter()
+            .find(|(height, _)| height.0 > tip_height);
         proto::LightdInfo {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             vendor: "Ztreamer".to_owned(),
             taddr_support: true,
             chain_name: self.chain_name.to_string(),
-            block_height: tip.map_or(0, |tip| u64::from(tip.height)),
-            estimated_height: tip.map_or(0, |tip| u64::from(tip.height)),
-            lightwallet_protocol_version: "0.5.0".to_owned(),
+            sapling_activation_height: NetworkUpgrade::Sapling
+                .activation_height(&network)
+                .map_or(0, |height| u64::from(height.0)),
+            consensus_branch_id: ConsensusBranchId::current(&network, block::Height(tip_height))
+                .unwrap_or(ConsensusBranchId::RPC_MISSING_ID)
+                .to_string(),
+            block_height: u64::from(tip_height),
+            estimated_height: u64::from(tip_height),
+            zcashd_build: format!("v{}", zakurad::application::build_version()),
+            zcashd_subversion: zakurad::application::user_agent(),
+            upgrade_name: next_upgrade.map_or_else(String::new, |(_, upgrade)| upgrade.to_string()),
+            upgrade_height: next_upgrade.map_or(0, |(height, _)| u64::from(height.0)),
+            lightwallet_protocol_version: "v0.5.0".to_owned(),
             ..Default::default()
         }
     }
@@ -1297,6 +1314,16 @@ mod tests {
                         .code(),
                     tonic::Code::Unavailable
                 );
+
+                service.snapshot.send_modify(|snapshot| {
+                    snapshot.visible_tip = Some(BlockId::new(3_464_754, [0; 32]));
+                });
+                let info = service.lightd_info();
+                assert_eq!(info.sapling_activation_height, 419_200);
+                assert_eq!(info.consensus_branch_id, "37a5165b");
+                assert_eq!(info.block_height, 3_464_754);
+                assert!(!info.zcashd_build.is_empty());
+                assert!(!info.zcashd_subversion.is_empty());
             });
     }
 
