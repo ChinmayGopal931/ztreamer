@@ -20,7 +20,6 @@ pub struct CompactBlockRecord {
     pub hash: Digest,
     pub previous_hash: Digest,
     pub time: u32,
-    pub header: Vec<u8>,
     pub transactions: Vec<CompactTransaction>,
     pub end_tree_sizes: TreeSizes,
 }
@@ -67,17 +66,13 @@ impl CompactBlockRecord {
     }
 }
 
-pub(crate) fn encoded_record_len(
-    header: &[u8],
-    transactions: &[CompactTransaction],
-) -> Result<usize, CodecError> {
+pub(crate) fn encoded_record_len(transactions: &[CompactTransaction]) -> Result<usize, CodecError> {
     #[derive(Serialize)]
     struct RecordRef<'a> {
         height: u32,
         hash: Digest,
         previous_hash: Digest,
         time: u32,
-        header: &'a [u8],
         transactions: &'a [CompactTransaction],
         end_tree_sizes: TreeSizes,
     }
@@ -87,7 +82,6 @@ pub(crate) fn encoded_record_len(
         hash: [0; 32],
         previous_hash: [0; 32],
         time: 0,
-        header,
         transactions,
         end_tree_sizes: TreeSizes::default(),
     };
@@ -118,17 +112,27 @@ pub fn encode_range(records: &[CompactBlockRecord]) -> Result<Vec<u8>, CodecErro
         return Err(CodecError::InvalidRange);
     }
 
-    let mut body = Vec::new();
-    let mut offsets = Vec::with_capacity(records.len() + 1);
-    for record in records {
-        offsets.push(u32::try_from(body.len()).map_err(|_| CodecError::Length)?);
-        let record = record.encode()?;
-        put_len(&mut body, record.len())?;
-        body.extend_from_slice(&record);
-    }
-    offsets.push(u32::try_from(body.len()).map_err(|_| CodecError::Length)?);
-
-    let mut bytes = Vec::new();
+    // offset table size is (number of records + 1) * 4 bytes
+    let offsets_len = records
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(size_of::<u32>()))
+        .ok_or(CodecError::Length)?;
+    // body size is (4 byte record length + serialized record) for each record
+    let body_len = records.iter().try_fold(0usize, |total, record| {
+        let record_len = encoded_record_len(&record.transactions)?;
+        total
+            .checked_add(size_of::<u32>())
+            .and_then(|total| total.checked_add(record_len))
+            .ok_or(CodecError::Length)
+    })?;
+    // total size is 1 byte version + 2 u32 start/end height fields + 2 Digest fields + offset table + body
+    let capacity = 1usize
+        .checked_add(2 * size_of::<u32>() + 2 * size_of::<Digest>())
+        .and_then(|len| len.checked_add(offsets_len))
+        .and_then(|len| len.checked_add(body_len))
+        .ok_or(CodecError::Length)?;
+    let mut bytes = Vec::with_capacity(capacity);
     bytes.push(RANGE_FORMAT_VERSION);
     put_u32(&mut bytes, records[0].height);
     put_u32(
@@ -137,10 +141,33 @@ pub fn encode_range(records: &[CompactBlockRecord]) -> Result<Vec<u8>, CodecErro
     );
     bytes.extend_from_slice(&records[0].previous_hash);
     bytes.extend_from_slice(&records.last().expect("range is non-empty").hash);
-    offsets
-        .into_iter()
-        .for_each(|offset| put_u32(&mut bytes, offset));
-    bytes.extend_from_slice(&body);
+    // reserve offset table
+    let offsets_start = bytes.len();
+    bytes.resize(offsets_start + offsets_len, 0);
+    let body_start = bytes.len();
+
+    // serialize directly into final buffer
+    for (index, record) in records.iter().enumerate() {
+        let offset = bytes.len() - body_start;
+        set_u32(&mut bytes, offsets_start + index * size_of::<u32>(), offset)?;
+        let length_offset = bytes.len();
+        put_u32(&mut bytes, 0);
+        let record_start = bytes.len();
+        record_options()
+            .serialize_into(&mut bytes, &(BLOCK_FORMAT_VERSION, record))
+            .map_err(|_| CodecError::Length)?;
+        // after serializing, backpatch the length field
+        let record_len = bytes.len() - record_start;
+        set_u32(&mut bytes, length_offset, record_len)?;
+    }
+    // write the 1001st offset to mark end of the body
+    let final_offset = bytes.len() - body_start;
+    set_u32(
+        &mut bytes,
+        offsets_start + records.len() * size_of::<u32>(),
+        final_offset,
+    )?;
+    debug_assert_eq!(final_offset, body_len);
     Ok(bytes)
 }
 
@@ -229,8 +256,12 @@ fn put_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_be_bytes());
 }
 
-fn put_len(bytes: &mut Vec<u8>, value: usize) -> Result<(), CodecError> {
-    put_u32(bytes, value.try_into().map_err(|_| CodecError::Length)?);
+fn set_u32(bytes: &mut [u8], offset: usize, value: usize) -> Result<(), CodecError> {
+    bytes[offset..offset + size_of::<u32>()].copy_from_slice(
+        &u32::try_from(value)
+            .map_err(|_| CodecError::Length)?
+            .to_be_bytes(),
+    );
     Ok(())
 }
 
@@ -307,7 +338,6 @@ mod tests {
             hash: [1; 32],
             previous_hash: [0; 32],
             time: 10,
-            header: vec![11; 140],
             transactions: vec![transaction],
             end_tree_sizes: TreeSizes {
                 sapling: 1,
@@ -318,7 +348,7 @@ mod tests {
         let encoded_first = first.encode().unwrap();
         assert_eq!(
             encoded_first.len(),
-            encoded_record_len(&first.header, &first.transactions).unwrap()
+            encoded_record_len(&first.transactions).unwrap()
         );
         assert_eq!(CompactBlockRecord::decode(&encoded_first).unwrap(), first);
         assert_eq!(
@@ -342,7 +372,6 @@ mod tests {
                 hash: hash(height),
                 previous_hash,
                 time: height,
-                header: Vec::new(),
                 transactions: Vec::new(),
                 end_tree_sizes: TreeSizes::default(),
             });

@@ -1353,7 +1353,6 @@ mod tests {
             hash: hash(height),
             previous_hash: hash(height - 1),
             time: height,
-            header: Vec::new(),
             transactions: Vec::new(),
             end_tree_sizes: ztreamer_indexer::codec::TreeSizes::default(),
         }
@@ -1368,7 +1367,6 @@ mod tests {
                     hash: hash(height),
                     previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
                     time: height,
-                    header: Vec::new(),
                     transactions: Vec::new(),
                     sapling_additions: 0,
                     orchard_additions: 0,

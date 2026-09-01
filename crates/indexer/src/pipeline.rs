@@ -605,7 +605,7 @@ mod tests {
         for height in 0..3 {
             builder.push(prepared(height)).unwrap();
         }
-        let batch_bytes = encoded_record_len(&[], &[]).unwrap();
+        let batch_bytes = encoded_record_len(&[]).unwrap();
         let first = builder
             .build_batch(Some(20), Some(20), batch_bytes)
             .unwrap()
@@ -650,7 +650,6 @@ mod tests {
             hash: hash(height),
             previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
             time: height,
-            header: Vec::new(),
             transactions: Vec::new(),
             sapling_additions: 0,
             orchard_additions: 0,

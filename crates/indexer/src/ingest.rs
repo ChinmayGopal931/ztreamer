@@ -63,7 +63,7 @@ impl OrderedBuilder {
                 height: block.height,
             });
         }
-        let bytes = encoded_record_len(&block.header, &block.transactions)?;
+        let bytes = encoded_record_len(&block.transactions)?;
         let pending_bytes = self
             .pending_bytes
             .checked_add(bytes)
@@ -190,7 +190,6 @@ impl OrderedBuilder {
                 hash: block.hash,
                 previous_hash: block.previous_hash,
                 time: block.time,
-                header: block.header,
                 transactions: block.transactions,
                 end_tree_sizes,
             });
@@ -254,7 +253,7 @@ mod tests {
 
     #[test]
     fn ready_bytes_exclude_blocks_beyond_a_gap() {
-        let bytes = encoded_record_len(&[], &[]).unwrap();
+        let bytes = encoded_record_len(&[]).unwrap();
         let mut builder = OrderedBuilder::new(IndexState::default(), 1_000_000).unwrap();
 
         builder.push(prepared(1)).unwrap();
@@ -273,7 +272,7 @@ mod tests {
 
     #[test]
     fn sealable_ranges_stay_in_one_batch() {
-        let bytes = encoded_record_len(&[], &[]).unwrap();
+        let bytes = encoded_record_len(&[]).unwrap();
         let mut builder = OrderedBuilder::new(IndexState::default(), 1_000_000).unwrap();
         for height in 0..RANGE_SIZE / 2 {
             builder.push(prepared(height)).unwrap();
@@ -301,7 +300,6 @@ mod tests {
             hash: hash(height),
             previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
             time: height,
-            header: Vec::new(),
             transactions: Vec::new(),
             sapling_additions: 0,
             orchard_additions: 0,

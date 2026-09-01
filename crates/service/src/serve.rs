@@ -192,7 +192,6 @@ mod tests {
             hash: [1; 32],
             previous_hash: [2; 32],
             time: 3,
-            header: vec![4; 140],
             transactions: vec![CompactTransaction {
                 index: 5,
                 txid: [6; 32],

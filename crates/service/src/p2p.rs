@@ -398,7 +398,6 @@ mod tests {
             hash,
             previous_hash,
             time: height,
-            header: Vec::new(),
             transactions: Vec::new(),
             end_tree_sizes: TreeSizes::default(),
         }

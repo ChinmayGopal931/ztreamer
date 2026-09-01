@@ -989,7 +989,6 @@ mod tests {
                     hash: branch_hash(height),
                     previous_hash,
                     time: height,
-                    header: Vec::new(),
                     transactions: Vec::new(),
                     end_tree_sizes: TreeSizes::default(),
                 };
@@ -1054,7 +1053,6 @@ mod tests {
                     hash: branch_hash(height),
                     previous_hash,
                     time: height,
-                    header: Vec::new(),
                     transactions: Vec::new(),
                     end_tree_sizes: TreeSizes::default(),
                 };
@@ -1105,7 +1103,6 @@ mod tests {
             hash: hash(height),
             previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
             time: height,
-            header: Vec::new(),
             transactions: Vec::new(),
             sapling_additions: 0,
             orchard_additions: 0,

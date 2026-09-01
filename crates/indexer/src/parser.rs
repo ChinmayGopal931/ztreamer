@@ -73,7 +73,6 @@ pub struct PreparedCompactBlock {
     pub hash: Digest,
     pub previous_hash: Digest,
     pub time: u32,
-    pub header: Vec<u8>,
     pub transactions: Vec<CompactTransaction>,
     pub sapling_additions: u32,
     pub orchard_additions: u32,
@@ -137,7 +136,6 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<PreparedCompactBlock, Compac
     reader
         .skip(solution_bytes)
         .map_err(|_| CompactParseError::TruncatedHeader { height })?;
-    let header_end = reader.offset;
     let transaction_count = reader
         .compact_size(MAX_VECTOR_ITEMS)
         .map_err(|source| CompactParseError::Framing { height, source })?;
@@ -205,7 +203,6 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<PreparedCompactBlock, Compac
         hash: block.hash.0,
         previous_hash,
         time,
-        header: block.bytes[..header_end].to_vec(),
         transactions,
         sapling_additions: sapling_additions
             .try_into()
@@ -592,11 +589,6 @@ mod tests {
                 .filter(CompactTransaction::has_payload)
                 .collect::<Vec<_>>();
             assert_eq!(parsed.transactions, expected_transactions);
-            assert_eq!(
-                parsed.header,
-                block.header.zcash_serialize_to_vec().unwrap()
-            );
-
             for (index, transaction) in block.transactions.iter().enumerate() {
                 let bytes = transaction.zcash_serialize_to_vec().unwrap();
                 let actual = parse_transaction(&bytes, transaction.hash(), index as u64).unwrap();
