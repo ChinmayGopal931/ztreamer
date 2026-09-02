@@ -2,7 +2,7 @@ use zakura_state::ZakuraDb;
 
 use crate::{
     index::{Index, IndexState},
-    pipeline::{PipelineConfig, PipelineError, sync_historical},
+    pipeline::{HistoricalPipeline, PipelineConfig, PipelineError},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -27,9 +27,10 @@ impl ZakuraSource {
         index: &Index,
         pipeline_config: PipelineConfig,
     ) -> Result<IndexState, ZakuraSyncError> {
+        let pipeline = HistoricalPipeline::new(index, &self.db, pipeline_config)?;
         let mut previous_tip = None;
         loop {
-            let state = sync_historical(index, &self.db, pipeline_config)?;
+            let state = pipeline.sync()?;
             if previous_tip == Some(state.durable_tip()) {
                 return Ok(state);
             }

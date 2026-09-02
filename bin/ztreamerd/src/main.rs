@@ -36,9 +36,9 @@ struct Cli {
     #[arg(long, default_value_t = NonZeroUsize::new(DEFAULT_MAP_SIZE).unwrap())]
     index_map_size: NonZeroUsize,
 
-    /// Historical Zakura fetch workers. Defaults to the pipeline setting.
-    #[arg(long)]
-    fetch_workers: Option<NonZeroUsize>,
+    /// Historical fetch/parse workers. Defaults to the pipeline setting.
+    #[arg(long = "fetch-workers")]
+    workers: Option<NonZeroUsize>,
 
     /// Consecutive blocks scanned by each historical fetch worker.
     #[arg(long)]
@@ -126,8 +126,8 @@ async fn main() -> Result<()> {
     }
 
     let mut pipeline = PipelineConfig::default();
-    if let Some(fetch_workers) = cli.fetch_workers {
-        pipeline.fetch_workers = fetch_workers.get();
+    if let Some(workers) = cli.workers {
+        pipeline.workers = workers.get();
     }
     if let Some(source_segment_blocks) = cli.source_segment_blocks {
         pipeline.source_segment_blocks = source_segment_blocks.get();

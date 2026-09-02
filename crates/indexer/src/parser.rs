@@ -165,7 +165,6 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<ParsedCompactBlock, CompactP
     let mut sapling_additions = 0usize;
     let mut orchard_additions = 0usize;
     let mut ironwood_additions = 0usize;
-
     for (index, txid) in block.txids.iter().enumerate() {
         let start = reader.offset;
         let compact =
@@ -218,7 +217,56 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<ParsedCompactBlock, CompactP
     })
 }
 
-#[cfg(test)]
+pub(crate) fn parse_stored_block<'a>(
+    height: u32,
+    hash: Digest,
+    previous_hash: Digest,
+    time: u32,
+    transactions: impl IntoIterator<Item = (&'a [u8], transaction::Hash)>,
+) -> Result<ParsedCompactBlock, CompactParseError> {
+    let mut compact = Vec::new();
+    let mut sapling_additions = 0usize;
+    let mut orchard_additions = 0usize;
+    let mut ironwood_additions = 0usize;
+    for (index, (bytes, txid)) in transactions.into_iter().enumerate() {
+        let transaction = parse_transaction(bytes, txid, index as u64).map_err(|source| {
+            CompactParseError::Transaction {
+                height,
+                index,
+                source,
+            }
+        })?;
+        sapling_additions = sapling_additions
+            .checked_add(transaction.sapling_outputs.len())
+            .ok_or(CompactParseError::CommitmentCount { height })?;
+        orchard_additions = orchard_additions
+            .checked_add(transaction.orchard_actions.len())
+            .ok_or(CompactParseError::CommitmentCount { height })?;
+        ironwood_additions = ironwood_additions
+            .checked_add(transaction.ironwood_actions.len())
+            .ok_or(CompactParseError::CommitmentCount { height })?;
+        if transaction.has_payload() {
+            compact.push(transaction);
+        }
+    }
+    Ok(ParsedCompactBlock {
+        height,
+        hash,
+        previous_hash,
+        time,
+        transactions: compact,
+        sapling_additions: sapling_additions
+            .try_into()
+            .map_err(|_| CompactParseError::CommitmentCount { height })?,
+        orchard_additions: orchard_additions
+            .try_into()
+            .map_err(|_| CompactParseError::CommitmentCount { height })?,
+        ironwood_additions: ironwood_additions
+            .try_into()
+            .map_err(|_| CompactParseError::CommitmentCount { height })?,
+    })
+}
+
 fn parse_transaction(
     bytes: &[u8],
     txid: transaction::Hash,
@@ -583,6 +631,23 @@ mod tests {
                     .collect(),
             })
             .unwrap();
+            let transaction_bytes = block
+                .transactions
+                .iter()
+                .map(|transaction| transaction.zcash_serialize_to_vec().unwrap())
+                .collect::<Vec<_>>();
+            let stored = parse_stored_block(
+                height.0,
+                block.hash().0,
+                block.header.previous_block_hash.0,
+                u32::try_from(block.header.time.timestamp()).unwrap(),
+                transaction_bytes
+                    .iter()
+                    .zip(&block.transactions)
+                    .map(|(bytes, transaction)| (bytes.as_slice(), transaction.hash())),
+            )
+            .unwrap();
+            assert_eq!(stored, parsed);
             let expected_transactions = block
                 .transactions
                 .iter()

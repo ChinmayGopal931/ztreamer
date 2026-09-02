@@ -23,6 +23,7 @@ const STATE: &[u8] = b"state";
 type HeightDb = Database<U32<BigEndian>, Bytes>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// References a block by hash and height.
 pub struct BlockId {
     pub height: u32,
     pub hash: Digest,
