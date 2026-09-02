@@ -414,50 +414,68 @@ impl CompactService {
             .acquire_owned()
             .await
             .map_err(|_| Status::unavailable("range reader pool is closed"))?;
-        // Capacity one plus the codec's fixed per-record limit bounds decoded response memory.
-        let (sender, receiver) = mpsc::channel(1);
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let emit = |record: &CompactBlockRecord| {
-                let block = if nullifiers {
-                    compact_block_nullifiers(record, pools)
-                } else {
-                    compact_block(record, pools)
-                };
-                sender.blocking_send(Ok(block)).is_ok()
-            };
-            let durable_tip = snapshot.durable_tip.map(|tip| tip.height);
-            let ascending = start <= end;
-            let result = (|| -> Result<(), IndexError> {
-                if ascending {
-                    if let Some(tip) = durable_tip
-                        && start <= tip
-                    {
-                        index.read_range(snapshot.generation, start, end.min(tip), |record| {
-                            emit(&record)
-                        })?;
-                    }
-                    let first = durable_tip.map_or(start, |tip| start.max(tip.saturating_add(1)));
-                    emit_volatile(&snapshot, first, end, true, &emit)
-                } else {
-                    let last_volatile =
-                        durable_tip.map_or(end, |tip| end.max(tip.saturating_add(1)));
-                    emit_volatile(&snapshot, start, last_volatile, false, &emit)?;
-                    if let Some(tip) = durable_tip
-                        && end <= tip
-                    {
-                        index.read_range(snapshot.generation, start.min(tip), end, |record| {
-                            emit(&record)
-                        })?;
-                    }
-                    Ok(())
+        let ascending = start <= end;
+        let durable_tip = snapshot.durable_tip.map(|tip| tip.height);
+        let mut cursor = Some(start);
+        let mut records = Vec::new().into_iter();
+        Ok(Box::pin(tokio_stream::iter(std::iter::from_fn(
+            move || loop {
+                if let Some(record) = records.next() {
+                    return Some(Ok(if nullifiers {
+                        compact_block_nullifiers(&record, pools)
+                    } else {
+                        compact_block(&record, pools)
+                    }));
                 }
-            })();
-            if let Err(error) = result {
-                let _ = sender.blocking_send(Err(index_status(error)));
-            }
-        });
-        Ok(Box::pin(ReceiverStream::new(receiver)))
+                let height = cursor?;
+                let mut chunk_end = if ascending {
+                    height.saturating_add(63).min(end)
+                } else {
+                    height.saturating_sub(63).max(end)
+                };
+                let durable = durable_tip.is_some_and(|tip| height <= tip);
+                if let Some(tip) = durable_tip {
+                    if ascending && durable {
+                        chunk_end = chunk_end.min(tip);
+                    } else if !ascending && !durable {
+                        chunk_end = chunk_end.max(tip.saturating_add(1));
+                    }
+                }
+                let mut chunk = Vec::with_capacity(64);
+                let result = if durable {
+                    index.read_range(snapshot.generation, height, chunk_end, |record| {
+                        chunk.push(record);
+                        true
+                    })
+                } else {
+                    (0..=height.abs_diff(chunk_end)).try_for_each(|offset| {
+                        let height = if ascending {
+                            height + offset
+                        } else {
+                            height - offset
+                        };
+                        chunk.push(
+                            snapshot
+                                .volatile(height)
+                                .ok_or(IndexError::Coverage { height })?
+                                .clone(),
+                        );
+                        Ok(())
+                    })
+                };
+                if let Err(error) = result {
+                    cursor = None;
+                    return Some(Err(index_status(error)));
+                }
+                cursor = (chunk_end != end).then_some(if ascending {
+                    chunk_end + 1
+                } else {
+                    chunk_end - 1
+                });
+                records = chunk.into_iter();
+                let _ = &permit;
+            },
+        ))))
     }
 
     pub(crate) async fn tree_state(
@@ -975,32 +993,6 @@ impl CompactService {
 
     pub(crate) fn unsupported(method: &'static str) -> Status {
         Status::unimplemented(format!("Ztreamer does not support {method}"))
-    }
-}
-
-fn emit_volatile(
-    snapshot: &ServingSnapshot,
-    start: u32,
-    end: u32,
-    ascending: bool,
-    emit: &impl Fn(&CompactBlockRecord) -> bool,
-) -> Result<(), IndexError> {
-    if (ascending && start > end) || (!ascending && start < end) {
-        return Ok(());
-    }
-    let mut height = start;
-    loop {
-        let record = snapshot
-            .volatile(height)
-            .ok_or(IndexError::Coverage { height })?;
-        if !emit(record) || height == end {
-            return Ok(());
-        }
-        height = if ascending {
-            height.checked_add(1).ok_or(IndexError::Overflow)?
-        } else {
-            height.checked_sub(1).ok_or(IndexError::Overflow)?
-        };
     }
 }
 
