@@ -1,3 +1,5 @@
+//! Repeats finalized historical passes until two consecutive Zakura tips agree.
+
 use zakura_state::ZakuraDb;
 
 use crate::{

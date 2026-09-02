@@ -1,3 +1,5 @@
+//! Message numbers, status encoding, and bounded frame reassembly for the custom p2p service.
+
 pub const SERVICE_ID: &str = "zakura.ztreamer.v1";
 pub const CAPABILITY: u64 = 1 << 17;
 pub const STREAM_KIND: u16 = 65;

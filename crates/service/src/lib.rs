@@ -1,3 +1,5 @@
+//! Shared CompactTxStreamer behavior with gRPC and Zakura p2p transport adapters.
+
 pub mod grpc;
 pub mod p2p;
 mod serve;

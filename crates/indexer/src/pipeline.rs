@@ -1,3 +1,5 @@
+//! Bounded parallel historical fetch-and-parse pipeline over Zakura's finalized database.
+
 use std::{
     sync::{
         Arc,

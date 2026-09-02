@@ -1,3 +1,5 @@
+//! Transport-independent requests, serving snapshots, readiness, and canonical-head following.
+
 use std::{
     collections::HashSet,
     pin::Pin,

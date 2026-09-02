@@ -1,3 +1,5 @@
+//! Selective parser for the wallet-scanning fields in Zcash transaction versions 1–6.
+
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use zakura_chain::{block, transaction};

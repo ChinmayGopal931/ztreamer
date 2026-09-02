@@ -1,3 +1,5 @@
+//! Compact index record projection, shielded-pool filtering, and protobuf response construction.
+
 use tonic::Status;
 use ztreamer_indexer::{
     codec::CompactBlockRecord,

@@ -1,3 +1,5 @@
+//! Generation-pinned LMDB reads, atomic writes, packed ranges, and reorg replacement.
+
 use std::{fs, io, path::Path};
 
 use heed::{

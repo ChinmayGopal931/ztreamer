@@ -1,3 +1,5 @@
+//! Compact block parsing, historical ingestion, LMDB storage, and canonical-head reconciliation.
+
 pub mod codec;
 pub mod head;
 pub mod index;

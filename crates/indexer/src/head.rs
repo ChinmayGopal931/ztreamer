@@ -1,3 +1,5 @@
+//! Live canonical-head polling, persistence-depth handling, and ordinary or deep reorg recovery.
+
 use zakura_chain::{
     block::{self, Block},
     serialization::ZcashSerialize,

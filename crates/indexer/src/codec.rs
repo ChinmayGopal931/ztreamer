@@ -1,3 +1,5 @@
+//! Versioned codecs for individual compact blocks and random-access 1,000-block ranges.
+
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 

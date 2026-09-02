@@ -1,3 +1,5 @@
+//! Restores parallel parser output to chain order and builds bounded LMDB write batches.
+
 use std::collections::BTreeMap;
 
 use crate::{
@@ -25,7 +27,8 @@ pub enum IngestError {
     Overflow,
 }
 
-/// Single-threaded coordinator between parallel parsers that push [`PreparedCompactBlock`]s out of order, and the [`crate::index::Index`].
+/// Single-threaded coordinator between parallel parsers that push
+/// out of order [`ParsedCompactBlock`]s and the [`crate::index::Index`].
 ///
 /// Produces [`WriteBatch`]es of ordered blocks.
 pub struct OrderedBuilder {
