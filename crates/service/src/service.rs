@@ -1067,7 +1067,7 @@ mod tests {
     use ztreamer_indexer::{
         head::HeadError,
         ingest::OrderedBuilder,
-        parser::{PreparedCompactBlock, RawIndexBlock},
+        parser::{ParsedCompactBlock, RawIndexBlock},
         pipeline::PipelineConfig,
     };
 
@@ -1389,7 +1389,7 @@ mod tests {
         let mut builder = OrderedBuilder::new(IndexState::default(), 1024 * 1024).unwrap();
         for height in 0..=tip {
             builder
-                .push(PreparedCompactBlock {
+                .push(ParsedCompactBlock {
                     height,
                     hash: hash(height),
                     previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),

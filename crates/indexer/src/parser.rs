@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use zakura_chain::{block, transaction};
 
-use crate::{Ciphertext, Digest};
+use crate::{Ciphertext, Digest, EphemeralKey};
 
 const MAX_TRANSACTION_BYTES: usize = 2_000_000;
 const MAX_VECTOR_ITEMS: usize = u16::MAX as usize;
@@ -34,7 +34,7 @@ pub struct RawIndexBlock {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompactSaplingOutput {
     pub cmu: Digest,
-    pub ephemeral_key: Digest,
+    pub ephemeral_key: EphemeralKey,
     #[serde(with = "BigArray")]
     pub ciphertext: Ciphertext,
 }
@@ -43,7 +43,7 @@ pub struct CompactSaplingOutput {
 pub struct CompactShieldedAction {
     pub nullifier: Digest,
     pub commitment: Digest,
-    pub ephemeral_key: Digest,
+    pub ephemeral_key: EphemeralKey,
     #[serde(with = "BigArray")]
     pub ciphertext: Ciphertext,
 }
@@ -68,7 +68,9 @@ impl CompactTransaction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedCompactBlock {
+/// Parser output that later gets converted into a
+/// [`crate::codec::CompactBlockRecord`]
+pub struct ParsedCompactBlock {
     pub height: u32,
     pub hash: Digest,
     pub previous_hash: Digest,
@@ -124,7 +126,7 @@ pub enum TransactionParseError {
     TrailingBytes { offset: usize },
 }
 
-pub fn parse_block(block: &RawIndexBlock) -> Result<PreparedCompactBlock, CompactParseError> {
+pub fn parse_block(block: &RawIndexBlock) -> Result<ParsedCompactBlock, CompactParseError> {
     let height = block.height.0;
     let mut reader = Reader::new(&block.bytes);
     reader
@@ -198,7 +200,7 @@ pub fn parse_block(block: &RawIndexBlock) -> Result<PreparedCompactBlock, Compac
         .finish()
         .map_err(|source| CompactParseError::Framing { height, source })?;
 
-    Ok(PreparedCompactBlock {
+    Ok(ParsedCompactBlock {
         height,
         hash: block.hash.0,
         previous_hash,

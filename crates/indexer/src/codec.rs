@@ -7,14 +7,10 @@ const BLOCK_FORMAT_VERSION: u8 = 1;
 const RANGE_FORMAT_VERSION: u8 = 1;
 const MAX_RECORD_BYTES: usize = 2_000_000;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TreeSizes {
-    pub sapling: u32,
-    pub orchard: u32,
-    pub ironwood: u32,
-}
+const RECORD_FIXED_BYTES: usize = 1 + 5 * size_of::<u32>() + 2 * size_of::<Digest>();
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// The final index record, which gets stored in LMDB.
 pub struct CompactBlockRecord {
     pub height: u32,
     pub hash: Digest,
@@ -22,6 +18,14 @@ pub struct CompactBlockRecord {
     pub time: u32,
     pub transactions: Vec<CompactTransaction>,
     pub end_tree_sizes: TreeSizes,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+/// Cumulative tree sizes per pool, by number of note commitments.
+pub struct TreeSizes {
+    pub sapling: u32,
+    pub orchard: u32,
+    pub ironwood: u32,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -49,6 +53,22 @@ impl CompactBlockRecord {
             .map_err(|_| CodecError::Length)
     }
 
+    pub(crate) fn encoded_len(&self) -> Result<usize, CodecError> {
+        Self::encoded_len_for_transactions(&self.transactions)
+    }
+
+    pub(crate) fn encoded_len_for_transactions(
+        transactions: &[CompactTransaction],
+    ) -> Result<usize, CodecError> {
+        record_options()
+            .serialized_size(transactions)
+            .ok()
+            .and_then(|len| usize::try_from(len).ok())
+            .and_then(|len| RECORD_FIXED_BYTES.checked_add(len))
+            .filter(|len| *len <= MAX_RECORD_BYTES)
+            .ok_or(CodecError::Length)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(CodecError::Length);
@@ -64,33 +84,6 @@ impl CompactBlockRecord {
         }
         Ok(record)
     }
-}
-
-pub(crate) fn encoded_record_len(transactions: &[CompactTransaction]) -> Result<usize, CodecError> {
-    #[derive(Serialize)]
-    struct RecordRef<'a> {
-        height: u32,
-        hash: Digest,
-        previous_hash: Digest,
-        time: u32,
-        transactions: &'a [CompactTransaction],
-        end_tree_sizes: TreeSizes,
-    }
-
-    let record = RecordRef {
-        height: 0,
-        hash: [0; 32],
-        previous_hash: [0; 32],
-        time: 0,
-        transactions,
-        end_tree_sizes: TreeSizes::default(),
-    };
-    record_options()
-        .serialized_size(&(BLOCK_FORMAT_VERSION, record))
-        .ok()
-        .and_then(|len| usize::try_from(len).ok())
-        .filter(|len| *len <= MAX_RECORD_BYTES)
-        .ok_or(CodecError::Length)
 }
 
 fn record_options() -> impl Options {
@@ -120,7 +113,7 @@ pub fn encode_range(records: &[CompactBlockRecord]) -> Result<Vec<u8>, CodecErro
         .ok_or(CodecError::Length)?;
     // body size is (4 byte record length + serialized record) for each record
     let body_len = records.iter().try_fold(0usize, |total, record| {
-        let record_len = encoded_record_len(&record.transactions)?;
+        let record_len = record.encoded_len()?;
         total
             .checked_add(size_of::<u32>())
             .and_then(|total| total.checked_add(record_len))
@@ -346,10 +339,7 @@ mod tests {
             },
         };
         let encoded_first = first.encode().unwrap();
-        assert_eq!(
-            encoded_first.len(),
-            encoded_record_len(&first.transactions).unwrap()
-        );
+        assert_eq!(encoded_first.len(), first.encoded_len().unwrap());
         assert_eq!(CompactBlockRecord::decode(&encoded_first).unwrap(), first);
         assert_eq!(
             CompactBlockRecord::decode(&[encoded_first, vec![0]].concat()),

@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::{
     Digest,
-    codec::{CodecError, CompactBlockRecord, TreeSizes, encoded_record_len},
+    codec::{CodecError, CompactBlockRecord, TreeSizes},
     index::{IndexState, RANGE_SIZE},
-    parser::PreparedCompactBlock,
+    parser::ParsedCompactBlock,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -39,7 +39,7 @@ pub struct OrderedBuilder {
     generation: u64,
 
     /// Ordered map of parsed blocks pending batch inclusion.
-    pending: BTreeMap<u32, (PreparedCompactBlock, usize)>,
+    pending: BTreeMap<u32, (ParsedCompactBlock, usize)>,
     /// Total encoded size of all blocks in `pending`.
     pending_bytes: usize,
 
@@ -83,13 +83,13 @@ impl OrderedBuilder {
     }
 
     /// Hands a block over to queue inclusion in a [`WriteBatch`]
-    pub fn push(&mut self, block: PreparedCompactBlock) -> Result<(), IngestError> {
+    pub fn push(&mut self, block: ParsedCompactBlock) -> Result<(), IngestError> {
         if block.height < self.next_height || self.pending.contains_key(&block.height) {
             return Err(IngestError::DuplicateHeight {
                 height: block.height,
             });
         }
-        let bytes = encoded_record_len(&block.transactions)?;
+        let bytes = CompactBlockRecord::encoded_len_for_transactions(&block.transactions)?;
         let pending_bytes = self
             .pending_bytes
             .checked_add(bytes)
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn ready_bytes_exclude_blocks_beyond_a_gap() {
-        let bytes = encoded_record_len(&[]).unwrap();
+        let bytes = CompactBlockRecord::encoded_len_for_transactions(&[]).unwrap();
         let mut builder = OrderedBuilder::new(IndexState::default(), 1_000_000).unwrap();
 
         builder.push(prepared(1)).unwrap();
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn sealable_ranges_stay_in_one_batch() {
-        let bytes = encoded_record_len(&[]).unwrap();
+        let bytes = CompactBlockRecord::encoded_len_for_transactions(&[]).unwrap();
         let mut builder = OrderedBuilder::new(IndexState::default(), 1_000_000).unwrap();
         for height in 0..RANGE_SIZE / 2 {
             builder.push(prepared(height)).unwrap();
@@ -320,8 +320,8 @@ mod tests {
         assert_eq!(batch.records.len(), RANGE_SIZE as usize);
     }
 
-    fn prepared(height: u32) -> PreparedCompactBlock {
-        PreparedCompactBlock {
+    fn prepared(height: u32) -> ParsedCompactBlock {
+        ParsedCompactBlock {
             height,
             hash: hash(height),
             previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),

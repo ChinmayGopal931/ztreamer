@@ -10,7 +10,7 @@ use crate::{
     codec::CompactBlockRecord,
     index::{Index, IndexError, IndexState, PERSIST_DEPTH, SEAL_DEPTH},
     ingest::{IngestError, OrderedBuilder},
-    parser::{CompactParseError, PreparedCompactBlock, RawIndexBlock, parse_block},
+    parser::{CompactParseError, ParsedCompactBlock, RawIndexBlock, parse_block},
     pipeline::PipelineConfig,
 };
 
@@ -112,7 +112,7 @@ pub async fn poll_canonical_head(
     source: &mut impl CanonicalBlockSource,
     start: u32,
     previous_hash: Digest,
-) -> Result<Vec<PreparedCompactBlock>, HeadError> {
+) -> Result<Vec<ParsedCompactBlock>, HeadError> {
     if let Some(anchor_height) = start.checked_sub(1) {
         let anchor = source
             .block(anchor_height)

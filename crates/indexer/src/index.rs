@@ -46,7 +46,7 @@ pub struct IndexState {
     /// LMDB's monotonically increasing revision number.
     /// Incremented on each successful atomic index mutation.
     pub(crate) generation: u64,
-    /// Cumulative [`TreeSizes`] at the end of [`durable_tip`]
+    /// Cumulative [`TreeSizes`] at the end of `durable_tip`
     pub(crate) tree_sizes: TreeSizes,
 }
 
@@ -775,7 +775,7 @@ fn identity(network: &str, genesis_hash: Digest) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{codec::decode_range_record, ingest::OrderedBuilder, parser::PreparedCompactBlock};
+    use crate::{codec::decode_range_record, ingest::OrderedBuilder, parser::ParsedCompactBlock};
 
     #[test]
     fn creates_four_databases_and_checks_chain_identity() {
@@ -1106,8 +1106,8 @@ mod tests {
             .unwrap()
     }
 
-    fn prepared(height: u32) -> PreparedCompactBlock {
-        PreparedCompactBlock {
+    fn prepared(height: u32) -> ParsedCompactBlock {
+        ParsedCompactBlock {
             height,
             hash: hash(height),
             previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),

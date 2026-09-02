@@ -180,7 +180,7 @@ pub(crate) fn sync_historical(
         let next = Arc::new(AtomicU64::new(u64::from(start)));
         let (raw_tx, raw_rx) = sync_channel::<RawIndexBlock>(0);
         let raw_rx = Arc::new(Mutex::new(raw_rx));
-        let (prepared_tx, prepared_rx) = sync_channel::<crate::parser::PreparedCompactBlock>(0);
+        let (prepared_tx, prepared_rx) = sync_channel::<crate::parser::ParsedCompactBlock>(0);
         let (batch_tx, batch_rx) = sync_channel::<WriteBatch>(1);
         let writer = scope.spawn(move || {
             let mut result: Result<IndexState, PipelineError> = Ok(initial_state);
@@ -596,8 +596,8 @@ mod tests {
     use std::sync::mpsc::{TrySendError, sync_channel};
 
     use super::*;
-    use crate::parser::PreparedCompactBlock;
-    use crate::{Digest, codec::encoded_record_len};
+    use crate::parser::ParsedCompactBlock;
+    use crate::{Digest, codec::CompactBlockRecord};
 
     #[test]
     fn builder_stays_one_batch_ahead_of_a_blocked_writer() {
@@ -605,7 +605,7 @@ mod tests {
         for height in 0..3 {
             builder.push(prepared(height)).unwrap();
         }
-        let batch_bytes = encoded_record_len(&[]).unwrap();
+        let batch_bytes = CompactBlockRecord::encoded_len_for_transactions(&[]).unwrap();
         let first = builder
             .build_batch(Some(20), Some(20), batch_bytes)
             .unwrap()
@@ -644,8 +644,8 @@ mod tests {
         });
     }
 
-    fn prepared(height: u32) -> PreparedCompactBlock {
-        PreparedCompactBlock {
+    fn prepared(height: u32) -> ParsedCompactBlock {
+        ParsedCompactBlock {
             height,
             hash: hash(height),
             previous_hash: height.checked_sub(1).map(hash).unwrap_or([0; 32]),
