@@ -6,10 +6,10 @@ use heed::{
     types::{Bytes, U32},
 };
 
-use crate::Digest;
 use crate::codec::{
     CodecError, CompactBlockRecord, RangeDecoder, TreeSizes, decode_range_record, encode_range,
 };
+use crate::{Digest, ingest::WriteBatch};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const RANGE_SIZE: u32 = 1_000;
@@ -35,36 +35,45 @@ impl BlockId {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Represents the [`Index`]'s current sync state.
 pub struct IndexState {
+    /// The highest contiguous compact block commited to [`Index::mutable_blocks`]
     pub(crate) durable_tip: Option<BlockId>,
+    /// The highest height committed to a [`Index::sealed_ranges`].
+    ///
+    /// Blocks above this height live in [`Index::mutable_blocks`].
     pub(crate) sealed_through: Option<u32>,
+    /// LMDB's monotonically increasing revision number.
+    /// Incremented on each successful atomic index mutation.
     pub(crate) generation: u64,
+    /// Cumulative [`TreeSizes`] at the end of [`durable_tip`]
     pub(crate) tree_sizes: TreeSizes,
 }
 
 impl IndexState {
+    /// Returns the highest contiguous compact block commited to
+    /// [`Index::mutable_blocks`]
     pub fn durable_tip(&self) -> Option<BlockId> {
         self.durable_tip
     }
 
+    /// Returns the highest height committed to a [`Index::sealed_ranges`].
+    ///
+    /// Blocks above this height live in [`Index::mutable_blocks`].
     pub fn sealed_through(&self) -> Option<u32> {
         self.sealed_through
     }
 
+    /// Identifies the exact committed revision of the durable index that an
+    /// [`IndexState`] describes.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
+    /// Cumulative [`TreeSizes`] at the end of [`IndexState::durable_tip`]
     pub fn tree_sizes(&self) -> TreeSizes {
         self.tree_sizes
     }
-}
-
-/// A batch whose ordering and cumulative tree sizes were checked by the ordered builder.
-pub struct WriteBatch {
-    pub(crate) base_generation: u64,
-    pub(crate) seal_through: Option<u32>,
-    pub(crate) records: Vec<CompactBlockRecord>,
 }
 
 #[derive(Debug, thiserror::Error)]

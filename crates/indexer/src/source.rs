@@ -21,6 +21,7 @@ impl ZakuraSource {
         Self { db }
     }
 
+    // Starts the historical sync process, populating the index
     pub fn sync(
         &self,
         index: &Index,

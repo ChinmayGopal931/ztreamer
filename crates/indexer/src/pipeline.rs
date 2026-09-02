@@ -17,7 +17,7 @@ use zakura_state::{TransactionLocation, ZakuraDb};
 
 use crate::{
     index::{Index, IndexError, IndexState},
-    ingest::{IngestError, OrderedBuilder},
+    ingest::{IngestError, OrderedBuilder, WriteBatch},
     parser::{CompactParseError, RawIndexBlock, parse_block},
 };
 
@@ -181,7 +181,7 @@ pub(crate) fn sync_historical(
         let (raw_tx, raw_rx) = sync_channel::<RawIndexBlock>(0);
         let raw_rx = Arc::new(Mutex::new(raw_rx));
         let (prepared_tx, prepared_rx) = sync_channel::<crate::parser::PreparedCompactBlock>(0);
-        let (batch_tx, batch_rx) = sync_channel::<crate::index::WriteBatch>(1);
+        let (batch_tx, batch_rx) = sync_channel::<WriteBatch>(1);
         let writer = scope.spawn(move || {
             let mut result: Result<IndexState, PipelineError> = Ok(initial_state);
             let mut stats = WriteStats::default();
@@ -610,7 +610,7 @@ mod tests {
             .build_batch(Some(20), Some(20), batch_bytes)
             .unwrap()
             .unwrap();
-        let (batch_tx, batch_rx) = sync_channel::<crate::index::WriteBatch>(1);
+        let (batch_tx, batch_rx) = sync_channel::<WriteBatch>(1);
         let (started_tx, started_rx) = sync_channel(0);
         let (release_tx, release_rx) = sync_channel(0);
 

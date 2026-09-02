@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::{
     Digest,
     codec::{CodecError, CompactBlockRecord, TreeSizes, encoded_record_len},
-    index::{IndexState, RANGE_SIZE, WriteBatch},
+    index::{IndexState, RANGE_SIZE},
     parser::PreparedCompactBlock,
 };
 
@@ -25,17 +25,42 @@ pub enum IngestError {
     Overflow,
 }
 
-/// Restores parser output to canonical height order under a byte budget.
+/// Single-threaded coordinator between parallel parsers that push [`PreparedCompactBlock`]s out of order, and the [`crate::index::Index`].
+///
+/// Produces [`WriteBatch`]es of ordered blocks.
 pub struct OrderedBuilder {
+    /// Lowest height that will be included in the next batch.
     next_height: u32,
+    /// Expected parent hash for `next_height`.
     previous_hash: Option<Digest>,
+    /// Cumulative [`TreeSizes`] immediately before `next_height`.
     tree_sizes: TreeSizes,
+    /// The next [`WriteBatch::base_generation`].
     generation: u64,
+
+    /// Ordered map of parsed blocks pending batch inclusion.
     pending: BTreeMap<u32, (PreparedCompactBlock, usize)>,
+    /// Total encoded size of all blocks in `pending`.
     pending_bytes: usize,
+
+    /// Exclusive end of the contiguous pending prefix starting at `next_height`.
     ready_end: u64,
+    /// Total encoded size of all blocks in `[next_heicht, ready_end)`.
     ready_bytes: usize,
+
+    /// Hard memory budget for pending.
     max_pending_bytes: usize,
+}
+
+/// An ordered batch produced by [`OrderedBuilder::build_batch`] for appending
+/// to the [`crate::index::Index`].
+pub struct WriteBatch {
+    /// Index generation the batch was built against.
+    pub(crate) base_generation: u64,
+    /// Blocks below and equaling this height are sealed,
+    /// the rest stored in `mutable_blocks`
+    pub(crate) seal_through: Option<u32>,
+    pub(crate) records: Vec<CompactBlockRecord>,
 }
 
 impl OrderedBuilder {
@@ -57,6 +82,7 @@ impl OrderedBuilder {
         })
     }
 
+    /// Hands a block over to queue inclusion in a [`WriteBatch`]
     pub fn push(&mut self, block: PreparedCompactBlock) -> Result<(), IngestError> {
         if block.height < self.next_height || self.pending.contains_key(&block.height) {
             return Err(IngestError::DuplicateHeight {
@@ -94,7 +120,7 @@ impl OrderedBuilder {
         self.ready_bytes
     }
 
-    /// Builds one bounded durable batch, leaving gaps and depth-0..9 blocks pending.
+    /// Builds a [`WriteBatch`], leaving gaps and depth-0..9 blocks pending.
     pub fn build_batch(
         &mut self,
         durable_through: Option<u32>,
