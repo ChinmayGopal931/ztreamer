@@ -8,7 +8,7 @@ use zakurad::node::NodeClient;
 use crate::{
     Digest,
     codec::CompactBlockRecord,
-    index::{Index, IndexError, IndexState, PERSIST_DEPTH, SEAL_DEPTH},
+    index::{BlockId, Index, IndexError, IndexState, PERSIST_DEPTH, SEAL_DEPTH},
     ingest::{IngestError, OrderedBuilder},
     parser::{CompactParseError, ParsedCompactBlock, RawIndexBlock, parse_block},
     pipeline::PipelineConfig,
@@ -51,7 +51,7 @@ pub enum HeadSyncError {
 /// The canonical-head operations Ztreamer needs from Zakura.
 #[tonic::async_trait]
 pub trait CanonicalBlockSource: Send {
-    async fn tip(&mut self) -> Result<Option<crate::index::BlockId>, HeadError> {
+    async fn tip(&mut self) -> Result<Option<BlockId>, HeadError> {
         Ok(None)
     }
 
@@ -81,11 +81,8 @@ fn raw_block(block: &Block) -> Result<RawIndexBlock, HeadError> {
 
 #[tonic::async_trait]
 impl CanonicalBlockSource for NodeClient {
-    async fn tip(&mut self) -> Result<Option<crate::index::BlockId>, HeadError> {
-        Ok(
-            NodeClient::tip(self)
-                .map(|(height, hash)| crate::index::BlockId::new(height.0, hash.0)),
-        )
+    async fn tip(&mut self) -> Result<Option<BlockId>, HeadError> {
+        Ok(NodeClient::tip(self).map(|(height, hash)| BlockId::new(height.0, hash.0)))
     }
 
     async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError> {
@@ -184,12 +181,7 @@ pub async fn sync_head_once(
         .last()
         .map(|block| block.hash)
         .expect("the current head is non-empty");
-    if source.tip().await?
-        == Some(crate::index::BlockId::new(
-            old_visible_tip,
-            old_visible_tip_hash,
-        ))
-    {
+    if source.tip().await? == Some(BlockId::new(old_visible_tip, old_visible_tip_hash)) {
         return Ok((state, current_head.to_vec()));
     }
     let anchor_height = old_visible_tip.checked_sub(SEAL_DEPTH);
@@ -206,11 +198,11 @@ pub async fn sync_head_once(
 
     let mut common = anchor_record
         .as_ref()
-        .map(|block| crate::index::BlockId::new(block.height, block.hash));
+        .map(|block| BlockId::new(block.height, block.hash));
     for block in &prepared {
         match current_record(index, state, current_head, block.height)? {
             Some(old) if old.hash == block.hash => {
-                common = Some(crate::index::BlockId::new(old.height, old.hash));
+                common = Some(BlockId::new(old.height, old.hash));
             }
             _ => break,
         }
@@ -221,7 +213,7 @@ pub async fn sync_head_once(
     let base_state = anchor_record
         .as_ref()
         .map_or_else(IndexState::default, |anchor| IndexState {
-            durable_tip: Some(crate::index::BlockId::new(anchor.height, anchor.hash)),
+            durable_tip: Some(BlockId::new(anchor.height, anchor.hash)),
             sealed_through: state.sealed_through(),
             generation: state.generation(),
             tree_sizes: anchor.end_tree_sizes,
@@ -253,7 +245,7 @@ pub async fn sync_head_once(
     if ancestor_height != old_durable_tip.height || !replacement.is_empty() {
         state = index.replace_mutable_suffix(
             state.generation(),
-            crate::index::BlockId::new(ancestor_record.height, ancestor_record.hash),
+            BlockId::new(ancestor_record.height, ancestor_record.hash),
             replacement,
             visible_tip.checked_sub(SEAL_DEPTH),
         )?;
@@ -313,7 +305,7 @@ pub async fn recover_deep_reorg(
     let prepared = poll_canonical_head(source, matching + 1, common.hash).await?;
     let visible_tip = prepared.last().map_or(matching, |block| block.height);
     let base_state = IndexState {
-        durable_tip: Some(crate::index::BlockId::new(common.height, common.hash)),
+        durable_tip: Some(BlockId::new(common.height, common.hash)),
         sealed_through: state.sealed_through(),
         generation: state.generation(),
         tree_sizes: common.end_tree_sizes,
@@ -337,7 +329,7 @@ pub async fn recover_deep_reorg(
         .collect();
     let state = index.replace_deep_suffix(
         state.generation(),
-        crate::index::BlockId::new(common.height, common.hash),
+        BlockId::new(common.height, common.hash),
         replacement,
         visible_tip.checked_sub(SEAL_DEPTH),
     )?;
@@ -408,20 +400,22 @@ fn current_record(
 
 #[cfg(test)]
 mod tests {
+    use crate::index::BlockId;
+
     use super::*;
     use zakura_chain::transaction;
 
     struct Source(Vec<RawIndexBlock>);
 
-    struct TipOnly(crate::index::BlockId);
+    struct TipOnly(BlockId);
 
     #[tonic::async_trait]
     impl CanonicalBlockSource for Source {
-        async fn tip(&mut self) -> Result<Option<crate::index::BlockId>, HeadError> {
+        async fn tip(&mut self) -> Result<Option<BlockId>, HeadError> {
             Ok(self
                 .0
                 .last()
-                .map(|block| crate::index::BlockId::new(block.height.0, block.hash.0)))
+                .map(|block| BlockId::new(block.height.0, block.hash.0)))
         }
 
         async fn block(&mut self, height: u32) -> Result<Option<RawIndexBlock>, HeadError> {
@@ -431,7 +425,7 @@ mod tests {
 
     #[tonic::async_trait]
     impl CanonicalBlockSource for TipOnly {
-        async fn tip(&mut self) -> Result<Option<crate::index::BlockId>, HeadError> {
+        async fn tip(&mut self) -> Result<Option<BlockId>, HeadError> {
             Ok(Some(self.0))
         }
 
@@ -499,7 +493,7 @@ mod tests {
                     sync_head_once(&index, &mut source, &[], PipelineConfig::default())
                         .await
                         .unwrap();
-                let mut source = TipOnly(crate::index::BlockId::new(20, hash(20)));
+                let mut source = TipOnly(BlockId::new(20, hash(20)));
 
                 let (next_state, next_head) =
                     sync_head_once(&index, &mut source, &head, PipelineConfig::default())

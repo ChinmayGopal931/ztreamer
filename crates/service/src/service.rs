@@ -23,7 +23,8 @@ use zakurad::node::NodeClient;
 use crate::serve::{PoolSelection, compact_block, compact_block_nullifiers};
 use ztreamer_indexer::{
     Digest,
-    head::{CanonicalBlockSource, HeadSyncError},
+    codec::CompactBlockRecord,
+    head::{CanonicalBlockSource, HeadSyncError, recover_deep_reorg},
     index::{BlockId, Index, IndexError, IndexState},
     pipeline::PipelineConfig,
 };
@@ -38,7 +39,7 @@ pub struct ServingSnapshot {
     pub generation: u64,
     pub durable_tip: Option<BlockId>,
     pub visible_tip: Option<BlockId>,
-    pub volatile_head: Arc<[ztreamer_indexer::codec::CompactBlockRecord]>,
+    pub volatile_head: Arc<[CompactBlockRecord]>,
     pub ready: bool,
     pub tip_fresh: bool,
     pub last_source_success: Option<Instant>,
@@ -98,7 +99,7 @@ pub enum HeadFollowerError {
 impl ServingSnapshot {
     fn with_head(
         state: IndexState,
-        volatile_head: Vec<ztreamer_indexer::codec::CompactBlockRecord>,
+        volatile_head: Vec<CompactBlockRecord>,
     ) -> Result<Self, SnapshotError> {
         let mut expected_height = state
             .durable_tip()
@@ -129,7 +130,7 @@ impl ServingSnapshot {
         })
     }
 
-    fn volatile(&self, height: u32) -> Option<&ztreamer_indexer::codec::CompactBlockRecord> {
+    fn volatile(&self, height: u32) -> Option<&CompactBlockRecord> {
         self.volatile_head
             .binary_search_by_key(&height, |block| block.height)
             .ok()
@@ -185,7 +186,7 @@ impl CompactService {
     pub fn publish_head(
         &self,
         state: IndexState,
-        volatile_head: Vec<ztreamer_indexer::codec::CompactBlockRecord>,
+        volatile_head: Vec<CompactBlockRecord>,
     ) -> Result<(), SnapshotError> {
         self.snapshot
             .send_replace(ServingSnapshot::with_head(state, volatile_head)?);
@@ -241,13 +242,8 @@ impl CompactService {
     ) -> Result<IndexState, HeadSyncError> {
         self.begin_recovery();
         let snapshot = self.snapshot();
-        let (state, head) = ztreamer_indexer::head::recover_deep_reorg(
-            &self.index,
-            source,
-            &snapshot.volatile_head,
-            config,
-        )
-        .await?;
+        let (state, head) =
+            recover_deep_reorg(&self.index, source, &snapshot.volatile_head, config).await?;
         self.publish_head(state, head)
             .expect("deep recovery must produce a connected snapshot");
         Ok(state)
@@ -327,10 +323,7 @@ impl CompactService {
         self.snapshot.borrow().clone()
     }
 
-    async fn record(
-        &self,
-        request: proto::BlockId,
-    ) -> Result<ztreamer_indexer::codec::CompactBlockRecord, Status> {
+    async fn record(&self, request: proto::BlockId) -> Result<CompactBlockRecord, Status> {
         let snapshot = self.snapshot();
         ensure_ready(&snapshot)?;
         if request.hash.is_empty() {
@@ -423,7 +416,7 @@ impl CompactService {
         let (sender, receiver) = mpsc::channel(1);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let emit = |record: &ztreamer_indexer::codec::CompactBlockRecord| {
+            let emit = |record: &CompactBlockRecord| {
                 let block = if nullifiers {
                     compact_block_nullifiers(record, pools)
                 } else {
@@ -988,7 +981,7 @@ fn emit_volatile(
     start: u32,
     end: u32,
     ascending: bool,
-    emit: &impl Fn(&ztreamer_indexer::codec::CompactBlockRecord) -> bool,
+    emit: &impl Fn(&CompactBlockRecord) -> bool,
 ) -> Result<(), IndexError> {
     if (ascending && start > end) || (!ascending && start < end) {
         return Ok(());
@@ -1065,6 +1058,7 @@ mod tests {
     use ztreamer_protocol::proto::compact_tx_streamer_server::CompactTxStreamer;
 
     use ztreamer_indexer::{
+        codec::CompactBlockRecord,
         head::HeadError,
         ingest::OrderedBuilder,
         parser::{ParsedCompactBlock, RawIndexBlock},
@@ -1374,8 +1368,8 @@ mod tests {
         }
     }
 
-    fn record(height: u32) -> ztreamer_indexer::codec::CompactBlockRecord {
-        ztreamer_indexer::codec::CompactBlockRecord {
+    fn record(height: u32) -> CompactBlockRecord {
+        CompactBlockRecord {
             height,
             hash: hash(height),
             previous_hash: hash(height - 1),
