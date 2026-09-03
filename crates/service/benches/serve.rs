@@ -3,8 +3,6 @@
 
 use std::sync::Arc;
 
-use std::time::Duration;
-
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio_stream::StreamExt as _;
 use tonic::Request;
@@ -100,7 +98,7 @@ fn get_block_range(c: &mut Criterion) {
     let service = CompactService::new(index, state, "main", read_service);
 
     let mut group = c.benchmark_group("get_block_range");
-    for blocks in [1, 100, 1_000] {
+    for blocks in [100, 200, 600, 1_000, 2_000] {
         group.throughput(Throughput::Elements(u64::from(blocks)));
         for (direction, start, end) in [
             ("ascending", TIP - blocks, TIP - 1),
@@ -129,14 +127,7 @@ fn get_block_range(c: &mut Criterion) {
 }
 
 fn criterion_config() -> Criterion {
-    let mut criterion = Criterion::default().noise_threshold(0.05).sample_size(50);
-    if std::env::var_os("CI").is_some() {
-        criterion = criterion
-            .warm_up_time(Duration::from_millis(300))
-            .measurement_time(Duration::from_secs(1))
-            .sample_size(10);
-    }
-    criterion
+    Criterion::default().noise_threshold(0.05).sample_size(50)
 }
 
 criterion_group! {
