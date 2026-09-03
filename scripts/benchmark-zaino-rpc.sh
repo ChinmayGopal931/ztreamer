@@ -21,7 +21,15 @@ zaino_metrics=${ZAINO_METRICS:-127.0.0.1:19998}
 
 [[ -d "$snapshot" ]] || { echo "Zakura cache is not a directory: $snapshot" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
-command -v setsid >/dev/null || { echo "setsid is required" >&2; exit 1; }
+session_cmd=()
+if command -v setsid >/dev/null; then
+    session_cmd=(setsid)
+elif command -v python3 >/dev/null; then
+    session_cmd=(python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
+else
+    echo "setsid or python3 is required to run benchmark process in its own session" >&2
+    exit 1
+fi
 if [[ ${PERF:-0} == 1 ]]; then
     command -v perf >/dev/null || { echo "perf is required when PERF=1" >&2; exit 1; }
 fi
@@ -83,7 +91,7 @@ CARGO_PROFILE_RELEASE_DEBUG=1 cargo build \
 zakurad="$zakura_repo/target/release/zakurad"
 zainod="$zaino_repo/target/release/zainod"
 
-setsid "$zakurad" -c "$run/zakura.toml" start > "$run/zakurad.log" 2>&1 &
+"${session_cmd[@]}" "$zakurad" -c "$run/zakura.toml" start > "$run/zakurad.log" 2>&1 &
 zakura_pid=$!
 zaino_group=
 zaino_pid=
@@ -134,7 +142,7 @@ fi
 
 echo "Running Zaino RPC benchmark; artifacts: $run"
 started_seconds=$SECONDS
-setsid "${command[@]}" > >(tee "$run/zainod.log") 2>&1 &
+"${session_cmd[@]}" "${command[@]}" > >(tee "$run/zainod.log") 2>&1 &
 zaino_group=$!
 
 for _ in {1..30}; do
