@@ -971,6 +971,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 
@@ -7975,6 +7976,7 @@ dependencies = [
 name = "ztreamer-service"
 version = "0.0.1"
 dependencies = [
+ "criterion",
  "hex",
  "prost",
  "tempfile",
@@ -7987,6 +7989,7 @@ dependencies = [
  "zakura-chain",
  "zakura-network",
  "zakura-state",
+ "zakura-test",
  "ztreamer-indexer",
  "ztreamer-protocol",
 ]
