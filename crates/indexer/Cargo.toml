@@ -19,5 +19,14 @@ zakura-state = { workspace = true, features = ["indexer"] }
 zakurad.workspace = true
 
 [dev-dependencies]
+criterion = "0.7"
 tempfile = "3"
 zakura-test.workspace = true
+
+[[bench]]
+name = "parser"
+harness = false
+
+[[bench]]
+name = "codec"
+harness = false
